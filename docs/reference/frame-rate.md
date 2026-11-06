@@ -20,6 +20,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** probes confirmed the legacy result: the framework presents at interval 1, VFR reports interval 1 with ratio 0.5, and when a frame runs long the game steps back to 2 with ratio 1, so the game speed does not change.
 - **Note:** the zeldaret/botw decompilation (`VFR.cpp`) gave the semantics; 1.9.0's addresses were found by the constants (`60 / interval`, the `fmov s11, #2.0` floor).
 
+### agl's interval controller: a world stepped by a fixed present interval
+
+- **Symptom:** a game that presents every vsync runs in slow motion when its frames take longer: at 27–32 fps Link walks and jumps at half speed. The log has `present interval set by the game 1` and no `the game sets present interval` line.
+- **Cause:** the game steps its world by its present interval and fixes that interval at 1. agl's display (Ocarina of Time: vtable `main+0x4c63f80`, frame method `main+0x3b4ea90`) runs an interval controller each frame on display `+0x270` (`main+0x3b4ef60`: bounds 1 and 3, the interval at `+0x48`, its fps 60 / interval at `+0x58`, a fixed bit at `+0x60`) and applies the fps through `setFrameRate` (`main+0x4dc0f0` → `nvnWindowSetPresentInterval`). The game's frame manager (`main+0x6e6be0`) steps the world by 60 / that fps every frame into its VFR object (`main+0x3b4e300`: step, its inverse, 60 / step) and a game-frame counter, and the pad's held-button counts take the same ratio. The game sets the fixed bit with interval 1 (`main+0x3372370`), so the controller never measures and each frame is one 1/60 s step whatever it takes.
+- **Fix:** a frame-step stub at the controller's first instruction after its prologue (the profile's `patches.py`, build `e0f3ccfa…`) sets the host's step as the interval and 60 / step as the fps, then takes the controller's own apply path, so the game presents at that interval and the manager steps the world by it; with no target or no step yet the original runs. `fps_target 60` in `game.tsv`. The VRR controller (`main+0x4dbda0`, used when the display reports variable refresh) is not stubbed: the host reports none.
+- **Check:** the premise first, in a running game: `DM_CTL` `poke` set the controller to interval 2 and fps 30 ([05-debugging.md](../agents/05-debugging.md#scripted-input-and-thread-scheduling)); the game presented at interval 2 (`the game sets present interval 1 → 2 (from main+0x4dc1ec)`), its VFR step read 2.0 (`peek`), and its game-frame counter advanced 60.1 frames a second against 43.9 at interval 1 (game speed 1.00 against 0.73). `dm/tools/tests/test_oot_fstep.py` runs the stub in unicorn (steps 1–3, no target, no step).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate) (v131072, M4 MacBook Air): game speed outdoors 0.49 → 0.96–0.98 of real time, in Link's house 0.79 → 0.98–1.00.
+
 ### A regress run stops when another app takes the key window
 
 - **Symptom:** `scripts/regress.py` reports a hang (`no frame after … s`, a state dump with every game thread waiting) in some runs of Tears of the Kingdom, baseline and candidate alike; the log's last focus line before it is `oe focus state → 2`, with no `→ 1` after it.
@@ -68,7 +76,6 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** `make -C dm/gfx/tests GAME=010015100B514000 t_fstep && dm/gfx/tests/t_fstep`: a cost falling 0.6% a frame fails the probe without the rule and holds with it (three windows); a flat cost, a cost that stops at 1.3 and a cost that falls without reaching the hold last 33, 63 and 183 frames.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#the-frame-step-current) (Mac M5 Pro, fullscreen, present snapshots, the host's profiler); resolved there: in a 470 s run with the rule switched every 30 s, every probe with it held (11 in a row).
 - **Note:** what shortens the serial chain itself, so the GPU's occupancy at a GPU-bound hold is higher and the clock rises faster: Metal encoding on its own thread (`DM_NVN_ENC_THREAD=1`, the profile's `enc_thread on`; the submit thread's translation 6.5 → about 4 ms a frame, measured on an M4 Pro and for Need for Speed), and a smaller first segment. Neither can start the GPU before the game's own work after its wait, and neither was measured on this symptom yet.
-
 
 ### A derived profile drops the frame step its build lacks
 

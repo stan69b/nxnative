@@ -1,6 +1,6 @@
 # The Legend of Zelda: Ocarina of Time (`0400486024DEC000`)
 
-A Switch 2 game: update v131072, SDK 22.2.8 (`Ounce`). Nintendo EPD's engine (sead, agl, gsys, Havok, CRIWARE; project `Owl`, with Tears of the Kingdom's file layout) on NVN2. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`, no rewriter patches. Status: plays on the Mac through the title, the opening, a new file's first scene, Link's house and Kokiri Forest, with saves, at about 59 fps with the picture close to console video. Mac only so far.
+A Switch 2 game: update v131072, SDK 22.2.8 (`Ounce`). Nintendo EPD's engine (sead, agl, gsys, Havok, CRIWARE; project `Owl`, with Tears of the Kingdom's file layout) on NVN2. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`; one rewriter patch, the frame step ([`patches.py`](patches.py)). Status: plays on the Mac through the title, the opening, a new file's first scene, Link's house and Kokiri Forest, with saves, at about 59 fps with the picture close to console video. Mac only so far.
 
 ## What it needs
 
@@ -13,6 +13,7 @@ A Switch 2 game: update v131072, SDK 22.2.8 (`Ounce`). Nintendo EPD's engine (se
 | `gpu_timestamps segment` | `game.tsv` | the game's dynamic resolution decides from GPU timestamps, and with one time per submission it never lowers its resolution ([why](../../../docs/reference/frame-rate.md#dynamic-resolution-that-never-moves-and-draw-passes-that-wait-for-each-other)) |
 | `draw_barriers game` | `game.tsv` | about 180 full barriers a frame NVN does not ask for: GPU 25 → 18 ms at full resolution |
 | `tex_flush_upload on`, `tex_dirty_upload on` | `game.tsv` | as Tears of the Kingdom: the CPU writes the terrain tiles' height (R32F), blend and hole (RGBA8) maps into textures after creating them. Without the keys those textures stay zero: flat blue holes in the ground around the path with grass floating in them, and grey stone where the console shows dirt |
+| `fps_target 60`, `FRAME_STEP` | `game.tsv`, [`patches.py`](patches.py) | the game steps its world by its present interval, which it fixes at 1: below 60 fps it ran in slow motion. The host now decides the interval each frame (60 where frames fit, 30 or 20 where not) and the world follows it ([why](../../../docs/reference/frame-rate.md#agls-interval-controller-a-world-stepped-by-a-fixed-present-interval)) |
 | `shader_groups`, `shader_note` | `game.tsv` | shaders grouped as `/Shader/`, `/Effect/`, `/Lib/`, `/UI/` |
 | `pad_layout full` | `game.tsv` | a 3D field and both sticks |
 
@@ -27,6 +28,22 @@ One [NUP container](../../../docs/development.md#the-packing-script-in-detail) o
 - Current: [`RED.F32.FTZ.RN`](../../../docs/reference/shaders.md#float-atomics-in-storage-memory) translates. The build's `Attribute offset 0x5C is not valid` (about 2,300 shaders) is a vertex shader's write to an output the translator drops, probably a shading rate, as `nvnCommandBufferBindShadingRateImage` and its family are no-ops: everything shades at full rate, which is right to look at and costs GPU time. Not verified against the hardware.
 
 ## Frame rate
+
+### Game speed and the frame step (current)
+
+The game steps its world one 1/60 s step a frame: agl's interval controller holds the present interval at 1, and the game's frame manager steps the world by 60 / that interval's fps ([how](../../../docs/reference/frame-rate.md#agls-interval-controller-a-world-stepped-by-a-fixed-present-interval)). So below 60 fps the world ran slower: on an Apple M4 MacBook Air (16 GB, fanless) at 27–32 fps outdoors Link ran and jumped at half speed. With the frame step (`fps_target 60`, the stub in `patches.py`) the host sets the interval each frame and the world follows it. Measured on the work folder's routes (`m-run/route.sh`: Link's house, 75 s standing then a 120 s walk; `route_out.sh`: Kokiri Forest from the owner's save, a 64 s camera pan), M4 Air, game speed from the host's `frame step: game time` line (before: frames a second / 60):
+
+| route | | fps | frame p50 / p95 / max ms | GPU span p50 ms | game speed |
+|---|---|---|---|---|---|
+| Kokiri Forest | before | 29.5 | 34.2 / 42.2 / 115 | 34.4 | 0.49 |
+| | frame step | 21.8 | 49.1 / 54.0 / 196 | 38.4 | 0.96–0.98 |
+| Link's house | before | 47.4 | 21.4 / 25.1 / 98 | 21.4 | 0.79 |
+| | frame step | 27.2 | 33.6 / 51.1 / 122 | 24.8 | 0.98–1.00 |
+
+- Current: game speed is right. Outdoors on this Mac 30 fps does not hold: the GPU time is above 33.3 ms, so the host holds most frames 3 vsyncs (20 fps). In the house the GPU time at 30 fps is p50 25.5 / p90 32.6 ms, at the edge of its 33.3 ms, so a burst of heavy frames steps to 20 fps and the trial back to 30 waits for 30 frames in a row under 28.3 ms, which the GPU, clocked down at 20 fps, reaches only now and then. Open: GPU time (next section's measurements are an M6's).
+- The frame step was first proven by hand: `DM_CTL` `poke` set the controller to interval 2 in a running game, and its game-frame counter advanced 60.1 frames a second at 30 fps against 43.9 at about 44 fps.
+
+### Measured on an M6
 
 Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk.sh` in the work folder).
 
@@ -116,3 +133,4 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - [Dead-code removal dropped a coordinate of a multi-output instruction](../../../docs/reference/shaders.md#dead-code-removal-dropped-a-coordinate-of-a-multi-output-instruction)
 - [An uncompressed texture the CPU filled after its first use stayed zeros](../../../docs/reference/memory.md#an-uncompressed-texture-the-cpu-filled-after-its-first-use-stayed-zeros): the holes of sky in Kokiri Forest's ground.
 - [A game paused out of focus looks hung before its first picture](../../../docs/reference/services.md#a-game-paused-out-of-focus-looks-hung-before-its-first-picture)
+- [agl's interval controller: a world stepped by a fixed present interval](../../../docs/reference/frame-rate.md#agls-interval-controller-a-world-stepped-by-a-fixed-present-interval): Link at half speed at 27–32 fps.
