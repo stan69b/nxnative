@@ -1931,6 +1931,9 @@ static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → g_fence
 // Bounded by ALIAS_GONE_MAX keys; past it the set is emptied and those IDs make their textures as before. Under g_smu
 enum { ALIAS_GONE_MAX = 1 << 16 };
 static nvn_hmap g_alias_gone = {.klen = sizeof(alias_key)};
+// Moves whenever a texture ID that read as such an empty slot could read something else: a texture enters the sharing table in a format with sRGB twins, a key leaves
+// g_alias_gone (made again, its pool gone, the set emptied), or a texture becomes CPU-written. tex_by_id keeps an ID's empty answer while it stands (treg_t.empty_gen)
+static _Atomic uint64_t g_tex_empty_gen = 1;
 // Live GPU-only image descriptions, including those not used yet. A dynamic-resolution family declares its largest image before any particular resolution is used.
 // Keeping only descriptions here lets its first allocation cover that family exactly, without allocating every resolution or rounding to a power of two.
 static nvn_hmap g_image_desc = {.klen = 8};   // serial → malloc'ed tex_t, under g_smu
@@ -1978,7 +1981,7 @@ void mtl_alias_drop_pool(const void *pool) {
     if (n) { g_ser_gen++; g_alias_evicted += n; }
     for (uint32_t i = 0; i < g_alias_gone.cap;) {   // deletion shifts entries: examine this slot again
         alias_key k; memcpy(&k, g_alias_gone.keys + (size_t)i * g_alias_gone.klen, sizeof k);
-        if (g_alias_gone.vals[i] && k.pool == (uint64_t)(uintptr_t)pool) nvn_hm_del(&g_alias_gone, &k); else i++;
+        if (g_alias_gone.vals[i] && k.pool == (uint64_t)(uintptr_t)pool) { nvn_hm_del(&g_alias_gone, &k); g_tex_empty_gen++; } else i++;
     }
     pthread_mutex_unlock(&g_smu);
     free(ks);
@@ -2015,7 +2018,7 @@ static void alias_take_over(const alias_key *nk) {
         void *old = nvn_hm_del(&g_alias, &ks[j]);
         if (!old) continue;
         nvn_hm_del(&g_alias_seen, &ks[j]);
-        if (g_alias_gone.n >= ALIAS_GONE_MAX) nvn_hm_clear(&g_alias_gone, NULL);
+        if (g_alias_gone.n >= ALIAS_GONE_MAX) { nvn_hm_clear(&g_alias_gone, NULL); g_tex_empty_gen++; }
         nvn_hm_put(&g_alias_gone, &ks[j], (void *)1);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
@@ -3243,7 +3246,7 @@ void mtl_tex_cpu_written(const tex_t *t) {
     int live = nvn_hm_get(&g_tex_live, &serial) != NULL;
     if ((live || (t->pool && t->mem)) && !nvn_hm_get(&g_cpu_tex, &serial) && !nvn_hm_get(&g_cpu_tex_retired, &serial)) {
         nvn_hm_put(live ? &g_cpu_tex : &g_cpu_tex_retired, &serial, t->pool ? (void *)t->pool : (void *)1);
-        ser_note(serial);   // its texture IDs resolve again through the packaged path (tex_by_id view_pkg)
+        ser_note(serial); g_tex_empty_gen++;   // its texture IDs resolve again through the packaged path (tex_by_id view_pkg), an empty one too
         static int n; if (n++ < 16) MLOG("CPU-written texture ser=%llu %ux%ux%u format %#x target %d levels %u: uploaded / re-uploaded like a swizzled texture", (unsigned long long)serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels);
     }
     pthread_mutex_unlock(&g_cpu_tex_mu);
@@ -3410,6 +3413,10 @@ static const uint8_t *srgb_twins(uint32_t f) {
     return f < 256 ? tw[f] : tw[0];
 }
 static uint64_t g_stat_retired_empty;   // retired texture IDs read as empty slots: their storage another texture took over (tex_mtl_)
+static uint64_t g_stat_retired_empty_kept;   // lookups of such IDs answered by tex_by_id's kept empty answer, without tex_mtl_
+// Set by tex_mtl_ when it reads a retired ID as an empty slot for reasons only g_tex_empty_gen can change: on the submit thread (tex_init_fill_may and the CPU-written checks
+// run only there), in a pool the CPU cannot write (no CPU content, no flushed range can give the texture content later). tex_by_id clears it before a lookup
+static __thread int t_tex_empty_kept;
 static id<MTLTexture> tex_mtl_(const tex_t *ct, int retired_id) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
@@ -3557,7 +3564,11 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct, int retired_id) {
         // new private texture here could only be zeros nothing names again. Read as an empty slot (0, as that texture would), unless the storage gives it content (tex_init_fill).
         // Making them took over the storage in turn and evicted the entries of IDs later in the same pool walk, made again when the walk reached them: in Ocarina of Time's Kokiri
         // Forest, 12,371 textures and 24.8 GB in 300 frames (aCidcOde, seedds/nxnative#1326). Texture objects and command snapshots still make theirs
-        if (retired_id && taken && !tex_init_fill_may(t, d.pixelFormat)) { g_stat_retired_empty++; return nil; }
+        if (retired_id && taken && !tex_init_fill_may(t, d.pixelFormat)) {
+            g_stat_retired_empty++;
+            t_tex_empty_kept = on_sub_thread() && (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL));
+            return nil;
+        }
         mt = image_texture(t, d);
         if (!mt) { mt = [g_dev newTextureWithDescriptor:d];
             if (mt) { res_add(mt); g_stat_tex_new++; g_stat_tex_new_by[live ? 0 : !retired_id ? 3 : taken ? 2 : 1]++; if (!tex_init_fill(t, mt)) tex_zero_fill(mt); } }
@@ -3572,7 +3583,9 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct, int retired_id) {
     pthread_mutex_lock(&g_smu);
     if (!g_alias_set) g_alias_set = CFSetCreateMutable(NULL, 0, NULL);
     alias_take_over(&ak);
-    hm_put_id(&g_alias, &ak, mt); CFSetAddValue(g_alias_set, (__bridge const void *)mt); nvn_hm_del(&g_alias_gone, &ak); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
+    hm_put_id(&g_alias, &ak, mt); CFSetAddValue(g_alias_set, (__bridge const void *)mt); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
+    // An ID read as empty can read this texture only through its own key (which leaves g_alias_gone here) or as an sRGB / linear view of it (a format with twins)
+    if (nvn_hm_del(&g_alias_gone, &ak) || srgb_twins(ak.d.format)[0]) g_tex_empty_gen++;
     pthread_mutex_unlock(&g_smu);
     tex_put(t->serial, mt);
     return mt;
@@ -3603,7 +3616,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
 #if TARGET_OS_IPHONE
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
-    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), private textures made %llu (for live objects %llu, retired IDs %llu, retired IDs over storage taken over that fills them %llu, other finalized objects %llu) and retired texture IDs read as empty over storage taken over %llu in total; headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, (unsigned long long)g_stat_tex_new, (unsigned long long)g_stat_tex_new_by[0], (unsigned long long)g_stat_tex_new_by[1], (unsigned long long)g_stat_tex_new_by[2], (unsigned long long)g_stat_tex_new_by[3], (unsigned long long)g_stat_retired_empty, avail);
+    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), private textures made %llu (for live objects %llu, retired IDs %llu, retired IDs over storage taken over that fills them %llu, other finalized objects %llu) and retired texture IDs read as empty over storage taken over %llu in total (and %llu lookups of them answered from the last one); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, (unsigned long long)g_stat_tex_new, (unsigned long long)g_stat_tex_new_by[0], (unsigned long long)g_stat_tex_new_by[1], (unsigned long long)g_stat_tex_new_by[2], (unsigned long long)g_stat_tex_new_by[3], (unsigned long long)g_stat_retired_empty, (unsigned long long)g_stat_retired_empty_kept, avail);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
@@ -5056,7 +5069,8 @@ void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 typedef struct { tex_t t; int ok; view_t v; int has_v; void *view; uint64_t view_id, view_rid, view_ser, view_dirty, view_stamp; const void *view_span; int view_pkg;   // view_pkg: CPU-written (packaged); only those depend on guest writes (view_dirty)
                  void *alt, *alt_of; uint64_t alt_rid; uint8_t alt_type;   // alt: compatible view used when the shader's declared type differs from view (tex_fit), alt_of = the view it was built from
                  void *im, *im_of; uint64_t im_rid;                       // im: the view an image slot reads in the shader's pixel class (img_fit), im_of = the view it was built from
-                 int prev, next, retired, gone; uint64_t transient_sub; } treg_t;   // prev / next: descriptor index + 1, by texture serial; gone: its memory pool was finalized (treg_drop_pool_views)
+                 int prev, next, retired, gone; uint64_t transient_sub;   // prev / next: descriptor index + 1, by texture serial; gone: its memory pool was finalized (treg_drop_pool_views)
+                 uint64_t empty_gen; } treg_t;   // g_tex_empty_gen at a lookup that read this retired ID as an empty slot (tex_mtl_'s t_tex_empty_kept), valid while it stands
 static treg_t *g_treg; static int g_ntreg;
 static nvn_hmap g_treg_serial = {.klen = 8};   // serial → first registered descriptor index + 1, under g_rmu
 // Texture ID views are valid for an epoch (view_ser), not for every serial table change: ser_sync takes the notes (ser_note) and sends only the IDs registered with a noted serial
@@ -5305,7 +5319,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
         reg_bump(id_, 0);
         treg_unlink(id_); treg_drop_views(rr);
         rr->ok = t != NULL; if (t) rr->t = *t; rr->has_v = v != NULL; if (v) rr->v = *v;
-        rr->retired = 0; rr->transient_sub = 0;
+        rr->retired = 0; rr->transient_sub = 0; rr->empty_gen = 0;
         if (t && t->serial) {
             pthread_mutex_lock(&g_smu); rr->retired = !nvn_hm_get(&g_tex_live, &t->serial); pthread_mutex_unlock(&g_smu);
             rr->next = (int)(uintptr_t)nvn_hm_get(&g_treg_serial, &t->serial);
@@ -5388,6 +5402,10 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
     if (rp->view && rp->view_ser == sg && (!rp->view_pkg || rp->view_dirty == dg)) return (__bridge id<MTLTexture>)rp->view;
     // A packaged texture whose pages nobody wrote since its upload stamp is what tex_mtl_ would find clean (the same test): keep the view without the serial table lookup
     if (rp->view && rp->view_ser == sg && rp->view_span && !nvn_dirty_since_span(rp->view_span, rp->t.mem, rp->t.L.size, rp->view_stamp)) { rp->view_dirty = dg; return (__bridge id<MTLTexture>)rp->view; }
+    // A retired ID read as an empty slot over storage another texture took (tex_mtl_) stays one until g_tex_empty_gen moves. Without this every whole pool walk resolved each of them
+    // again: the sharing table, its sRGB twins, a texture descriptor (Ocarina of Time's Kokiri Forest: about 1.25 million such lookups in a 120 s walk)
+    uint64_t eg = atomic_load_explicit(&g_tex_empty_gen, memory_order_relaxed);
+    if (!rp->view && rp->empty_gen == eg && !rp->gone) { g_stat_retired_empty_kept++; return nil; }
     id<MTLTexture> v = (__bridge id<MTLTexture>)rp->view;
     // Guest writes (nvn_dirty_now) matter only to CPU-written textures: a texture that becomes CPU-written later bumps g_ser_gen once (mtl_tex_cpu_written), which sends its ID through here again.
     // Before, every guest write to any protected page sent every texture ID, render targets included, down this path
@@ -5398,7 +5416,9 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
         defer_obj_unref(v); CFRelease(rp->view); rp->view = NULL; rp->view_rid = 0; v = nil;
     }
     treg_t r = *rp;
+    t_tex_empty_kept = 0;
     id<MTLTexture> base = treg_tex(rp);
+    if (!base && t_tex_empty_kept && rp->retired && !rp->gone) { rp->empty_gen = eg; t_tex_empty_kept = 0; return nil; }
     if (!base) { if (rp->gone) { static uint64_t n; if (n++ < 4) MLOG("texture ID %d read after its memory pool was finalized ser=%llu %ux%u format %#x: treated as an empty slot (%llu so far)", tid, (unsigned long long)rp->t.serial, rp->t.d.width, rp->t.d.height, rp->t.d.format, (unsigned long long)n); } return nil; }
     v = base;
     // Channel swizzle: the view's if set, otherwise the one from texture building; identity builds no view (SMBW's font cache is (1 1 1 R): without the swizzle glyphs become white blocks).
@@ -8015,7 +8035,9 @@ static uint64_t pool_entry(int samp, int dtt, int id_, int *gone, int *transient
     if (id_ <= 0) return 0;
     if (samp) return id_ < g_nsreg && g_sreg_ok[id_] && samp_fast(id_) ? g_srid[id_] : 0;
     if (id_ >= g_ntreg || !g_treg[id_].ok) return 0;
-    if (g_treg[id_].gone || (!g_treg[id_].view && !tex_storage_live(&g_treg[id_].t))) { ++*gone; return 0; }
+    if (g_treg[id_].gone) { ++*gone; return 0; }
+    if (!g_treg[id_].view && g_treg[id_].empty_gen == atomic_load_explicit(&g_tex_empty_gen, memory_order_relaxed)) { g_stat_retired_empty_kept++; return 0; }   // tex_by_id's kept empty answer, before the storage lookup
+    if (!g_treg[id_].view && !tex_storage_live(&g_treg[id_].t)) { ++*gone; return 0; }
     void *tv = NULL; uint64_t tr = tex_fast_rid(id_, &tv);
     if (!tv || ((__bridge id<MTLTexture>)tv).textureType != (MTLTextureType)dtt) return 0;
     *transient |= g_treg[id_].retired && g_treg[id_].transient_sub == g_sub_serial;

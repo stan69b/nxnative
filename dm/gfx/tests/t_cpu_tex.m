@@ -185,7 +185,51 @@ static void retired_takeover_chain(void) {
     CHECK(real_last == SLOTS, "retired IDs whose shared texture still holds the storage resolve to it");
     CHECK(real_old == 0, "retired IDs whose storage another texture took over read as empty slots");
     CHECK(g_stat_tex_new - made0 == SLOTS * ROUNDS, "one Metal texture per texture object");
-    for (int i = 0; i < SLOTS * ROUNDS; i++) mtl_reg_tex(FIRST + i, NULL, NULL);
+    // The CPU cost of those empty slots: each whole walk resolved every one of them again (tex_mtl_: the sharing table, the sRGB twins, a texture descriptor). In a 120 s walk in
+    // Kokiri Forest 1.25 million such lookups, while submit+present grew from 4 to 16 ms. A second whole walk over the same IDs, nothing made in between, resolves none again
+    uint64_t e0 = g_stat_retired_empty, emptied = 0; __unsafe_unretained id<MTLBuffer> tb2 = nil;
+    mtl_sub_begin();
+    os_unfair_lock_lock(&g_rmu); g_ser_gen++; pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &tb2); os_unfair_lock_unlock(&g_rmu);
+    emptied = g_stat_retired_empty - e0;
+    ok = mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error();
+    printf("retired takeover chain: a second whole walk resolved %llu empty retired IDs again\n", (unsigned long long)emptied);
+    CHECK(ok && emptied == 0, "a second pool walk does not resolve again the retired IDs it read as empty");
+    // Until the key is made again: a live object with round 0's description over slot 0 takes the storage back, and the first round's retired ID there reads its texture
+    for (int k = 0; k <= ALIAS_IDLE; k++) { mtl_sub_begin(); ok &= mtl_wait(mtl_sub_commit(), 5000000000ull); }
+    mtl_sub_begin();
+    NVNtextureBuilder tb0; NVNtexture back = {0}; h_nvnTextureBuilderSetDefaults(&tb0);
+    h_nvnTextureBuilderSetWidth(&tb0, 64); h_nvnTextureBuilderSetHeight(&tb0, 32); h_nvnTextureBuilderSetFormat(&tb0, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetFlags(&tb0, NVN_TEXTURE_FLAGS_COMPRESSIBLE); h_nvnTextureBuilderSetStorage(&tb0, &pool, 0);
+    ok &= h_nvnTextureInitialize(&back, &tb0);
+    mtl_reg_tex(FIRST + SLOTS * ROUNDS, (const tex_t *)&back, NULL);
+    os_unfair_lock_lock(&g_rmu);
+    id<MTLTexture> made_back = tex_by_id(FIRST + SLOTS * ROUNDS);
+    g_ser_gen++; pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &tb2);
+    const uint64_t *e2 = (const uint64_t *)((const char *)tb2.contents + DMSH_POOL_HEAD);
+    int back_real = made_back && e2[FIRST] == made_back.gpuResourceID._impl, still_empty = e2[FIRST + 1] == g_dummy_tex_rid[MTLTextureType2D][NVN_DPF_FLOAT];
+    os_unfair_lock_unlock(&g_rmu);
+    ok &= mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error();
+    CHECK(ok && back_real, "a retired ID read as empty reads its key's texture once the key is made again");
+    CHECK(still_empty, "the other retired IDs over storage taken over still read as empty slots");
+    // Or its sRGB twin is: a live RGBA8_SRGB object with round 0's description over slot 1, and the RGBA8 retired ID there reads a view of it
+    for (int k = 0; k <= ALIAS_IDLE; k++) { mtl_sub_begin(); ok &= mtl_wait(mtl_sub_commit(), 5000000000ull); }
+    mtl_sub_begin();
+    NVNtexture twin = {0}; h_nvnTextureBuilderSetFormat(&tb0, NVN_FORMAT_RGBA8_SRGB); h_nvnTextureBuilderSetStorage(&tb0, &pool, STRIDE);
+    ok &= h_nvnTextureInitialize(&twin, &tb0);
+    mtl_reg_tex(FIRST + SLOTS * ROUNDS + 1, (const tex_t *)&twin, NULL);
+    os_unfair_lock_lock(&g_rmu);
+    id<MTLTexture> made_twin = tex_by_id(FIRST + SLOTS * ROUNDS + 1);
+    g_ser_gen++; pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &tb2);
+    const uint64_t *e3 = (const uint64_t *)((const char *)tb2.contents + DMSH_POOL_HEAD);
+    int twin_real = made_twin && e3[FIRST + 1] != g_dummy_tex_rid[MTLTextureType2D][NVN_DPF_FLOAT], twin_view = 0;
+    if (twin_real) { id<MTLTexture> v = (__bridge id<MTLTexture>)g_treg[FIRST + 1].view; twin_view = v.parentTexture == made_twin && v.pixelFormat == MTLPixelFormatRGBA8Unorm; }
+    still_empty = e3[FIRST + 2] == g_dummy_tex_rid[MTLTextureType2D][NVN_DPF_FLOAT];
+    os_unfair_lock_unlock(&g_rmu);
+    ok &= mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error();
+    CHECK(ok && twin_real && twin_view, "a retired ID read as empty reads a view of its key's sRGB twin once that is made");
+    CHECK(still_empty, "and the others still read as empty slots");
+    h_nvnTextureFinalize(&twin); h_nvnTextureFinalize(&back);
+    for (int i = 0; i <= SLOTS * ROUNDS + 1; i++) mtl_reg_tex(FIRST + i, NULL, NULL);
     h_nvnMemoryPoolFinalize(&pool);
     defer_drain(); munmap(mem, len);
 }
@@ -207,11 +251,14 @@ static void ptb_recycle(void) {
     id<MTLBuffer> d = ptb_get(4096);
     CHECK(d == a && resident(d) && g_stat_ptb_reused == reused0 + 1, "once its fence completes the retired table is reused, still resident");
     ptb_retire(b); ptb_retire(c); ptb_retire(d);
-    size_t deferred0; pthread_mutex_lock(&g_deferred_mu); deferred0 = g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
-    int kept = g_nptb;
-    for (int i = 0; i < PTB_KEEP; i++) { id<MTLBuffer> e = [g_dev newBufferWithLength:1024 options:MTLResourceStorageModeShared]; res_add(e); ptb_retire(e); }
-    size_t deferred1; pthread_mutex_lock(&g_deferred_mu); deferred1 = g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
-    CHECK(g_nptb == PTB_KEEP && deferred1 == deferred0 + (size_t)kept, "past PTB_KEEP the oldest retired tables go to the deferred release");
+    // The tables that left are followed themselves, not the queue's length: an earlier submission's completion handler may drain the queue meanwhile. Each one is queued for the
+    // deferred release, or that drain has released it already (out of the residency set)
+    int kept = g_nptb; NSMutableSet *all = [NSMutableSet set]; for (int i = 0; i < kept; i++) [all addObject:g_ptb[i].b];
+    for (int i = 0; i < PTB_KEEP; i++) { id<MTLBuffer> e = [g_dev newBufferWithLength:1024 options:MTLResourceStorageModeShared]; res_add(e); [all addObject:e]; ptb_retire(e); }
+    NSMutableSet *left = [all mutableCopy]; for (int i = 0; i < g_nptb; i++) [left removeObject:g_ptb[i].b];
+    int went = 0; pthread_mutex_lock(&g_deferred_mu); NSMutableSet *queued = [NSMutableSet set]; for (NvDeferredRelease *q in g_deferred) if (!q->keep_resident) [queued addObject:q->object]; pthread_mutex_unlock(&g_deferred_mu);
+    for (id b in left) went += [queued containsObject:b] || !resident(b);
+    CHECK(g_nptb == PTB_KEEP && left.count == (NSUInteger)kept && went == kept, "past PTB_KEEP the oldest retired tables go to the deferred release");
     while (g_nptb) { defer_obj_release(g_ptb[--g_nptb].b); g_ptb[g_nptb].b = nil; }
     atomic_store(&g_fence, fence0); atomic_store(&g_done, done0);
 }
