@@ -114,4 +114,5 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - [Image atomics on a 32-bit colour texture](../../../docs/reference/shaders.md#image-atomics-on-a-32-bit-colour-texture)
 - [A host's own store in a fragment shader moves its depth test](../../../docs/reference/frame-rate.md#a-hosts-own-store-in-a-fragment-shader-moves-its-depth-test)
 - [Dead-code removal dropped a coordinate of a multi-output instruction](../../../docs/reference/shaders.md#dead-code-removal-dropped-a-coordinate-of-a-multi-output-instruction)
+- [An uncompressed texture the CPU filled after its first use stayed zeros](../../../docs/reference/memory.md#an-uncompressed-texture-the-cpu-filled-after-its-first-use-stayed-zeros): the holes of sky in Kokiri Forest's ground.
 - [A game paused out of focus looks hung before its first picture](../../../docs/reference/services.md#a-game-paused-out-of-focus-looks-hung-before-its-first-picture)

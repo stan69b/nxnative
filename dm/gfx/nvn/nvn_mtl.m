@@ -3236,11 +3236,23 @@ static void cpu_tex_drop_pool(const void *pool) {
             else i++;
     pthread_mutex_unlock(&g_cpu_tex_mu);
 }
-// The GPU owns the texture's content: its host texture was made to be rendered into or written by shaders (nvn_ft_poll in hle_nvn.c never re-uploads such a texture from guest memory)
+// The GPU owns the texture's content: shaders may write its host texture (the game's IMAGE flag), or the GPU has written it (tex_gpu_mark). nvn_ft_poll in hle_nvn.c never re-uploads such a
+// texture from guest memory. Render-target use alone says nothing: tex_desc gives it to every uncompressed texture not taken from its storage, as NVN has no flag for a render target. Taken
+// as ownership, it kept every uncompressed texture the CPU filled after its first use at the content it had then. Ocarina of Time's terrain tiles (260x260 R32F heights and RGBA8 hole / blend
+// maps, flags 0, filled by the CPU with no flush) came out zero whenever a tile was first drawn before its fill, which depends on timing: holes of sky in the ground, different in every run
+static char g_gw_key;   // on a host texture the GPU has written (tex_gpu_mark)
 int mtl_tex_gpu_owned(uint64_t serial) {
     __unsafe_unretained id o = tex_get(serial);
     if (!o || ![o conformsToProtocol:@protocol(MTLTexture)]) return 0;
-    return (((id<MTLTexture>)o).usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
+    MTLTextureUsage u = ((id<MTLTexture>)o).usage;
+    return (u & MTLTextureUsageShaderWrite) || ((u & MTLTextureUsageRenderTarget) && objc_getAssociatedObject(o, &g_gw_key));
+}
+// The GPU writes t's host texture: an attachment, an image, a clear, DrawTexture, DLSS's output, or a copy whose bytes the storage does not get (tex_storage_dst: a copy into a texture uploaded from
+// its storage is written there too, so the storage stays its content). Called after any upgrade, which replaces the host texture (tex_upgrade). A packaged texture's record is not marked
+static void tex_gpu_mark(const tex_t *t) {
+    if (!t || !t->serial) return;
+    __unsafe_unretained id o = tex_get(t->serial);
+    if (o && [o conformsToProtocol:@protocol(MTLTexture)] && !objc_getAssociatedObject(o, &g_gw_key)) objc_setAssociatedObject(o, &g_gw_key, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 void mtl_tex_cpu_written(const tex_t *t) {
     uint64_t serial = t->serial;
@@ -4243,6 +4255,7 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
     // A texture made without render-target use (packaged or CPU-written, uploaded from its storage) drawn into: give it that use, as a clear of one does (clear_tex). Metal's validation
     // stops at such an attachment; without it Tears of the Kingdom drew its terrain normal maps into textures made for reading only
     if (base && !(base.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(base.pixelFormat) && base.sampleCount == 1) base = tex_upgrade(t, base, MTLTextureUsageRenderTarget, base.pixelFormat);
+    tex_gpu_mark(t);
     a.texture = base;
     if (has_v && v->set_levels) a.level = v->base_level;
     if (has_v && v->set_layers) { if (t->d.target == 2) a.depthPlane = v->min_layer; else a.slice = v->min_layer; }
@@ -8279,7 +8292,7 @@ static void image_prepare(NvProg *pr, unsigned stages) {
             if (tid >= g_ntreg || !g_treg[tid].ok || g_treg[tid].gone) { os_unfair_lock_unlock(&g_rmu); continue; }
             // The actual image binding is image intent too: some engines write a descriptor with RegisterTexture and use its handle in an image slot.
             tex_t image = g_treg[tid].t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; mtl_pool_gpu_written(image.pool);
-            id<MTLTexture> base = tex_mtl(&image); sparse_gpu_wrote(&image); while (base.parentTexture) base = base.parentTexture;
+            id<MTLTexture> base = tex_mtl(&image); sparse_gpu_wrote(&image); tex_gpu_mark(&image); while (base.parentTexture) base = base.parentTexture;
             int reinterpret = b->atom && b->dpf != NVN_DPF_FLOAT && tex_atomic_alias(base);
             int upgrade = base && (!(base.usage & MTLTextureUsageShaderWrite) || reinterpret);
             os_unfair_lock_unlock(&g_rmu);
@@ -12111,6 +12124,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     // The copy's bytes belong in the texture's storage: written there now from the buffer's, unless the GPU writes the buffer (a copy, fill or update queued in this submission: pend_hits; a shader
     // or a texture→buffer copy of it: sbw_hits; one of a submission still running: gw_live) or a readback into the texture is pending (read back after the copy then)
     int rb = !is3d && tex_storage_dst(c->tex);
+    if (!rb) tex_gpu_mark(c->tex);   // its storage does not get the copy
     if (rb && img * nz && !mrb_pending(c->tex->serial) && !pend_hits(c->src, img * nz) && !g_sbw_over && !sbw_hits(c->src, c->src + img * nz) && !gw_live(c->src, c->src + img * nz)
         && nvn_host_readable(c->src, img * nz) && !nvn_tex_mirror_b2t(c->tex, level, layer0, &c->r, (const uint8_t *)(uintptr_t)c->src, row, img)) { mirror_note(0, c->tex, level, "buffer", 0); rb = 0; }
     g_cut_copy = 1;
@@ -12238,7 +12252,7 @@ static void draw_tex(const p_draw_tex *c) {
     for (int k = 0; k < R.rt.n && k < 8; k++) {
         const tex_t *rt = R.rt.color[k]; if (!rt) continue;
         uint32_t wm = (S.chmask.mask >> (4 * k)) & 0xf; if (!wm) continue;
-        id<MTLTexture> d = tex_mtl(rt); uint64_t ser; int lv, sl; rt_sub(&R.rt, k, &ser, &lv, &sl);
+        id<MTLTexture> d = tex_mtl(rt); uint64_t ser; int lv, sl; rt_sub(&R.rt, k, &ser, &lv, &sl); tex_gpu_mark(rt);
         if (!d || fmt_int_or_ds(d.pixelFormat) || mtl_fmt_block(d.pixelFormat) || !(d.usage & MTLTextureUsageRenderTarget)) { RED_ONCE(125, "DrawTexture: target %d (format %lu) not drawn", k, d ? (unsigned long)d.pixelFormat : 0ul); continue; }
         NSNumber *pk = @(d.pixelFormat * 16 + wm);
         id<MTLRenderPipelineState> ps = pso[pk];
@@ -12327,6 +12341,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     // The copy's bytes belong in the destination's storage: written there now from the source's storage when that holds its content and the copy is a plain one (the same Metal format: a
     // format change is drawn below and converts the bytes), else read back after the copy (decided before the draw path gives the destination render-target use, which makes it GPU-owned from then on)
     int rb = !d3 && tex_storage_dst(c->dst);
+    if (!rb) tex_gpu_mark(c->dst);   // its storage does not get the copy
     if (rb && !s3 && c->sr.width == c->dr.width && c->sr.height == c->dr.height && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT)) && s.pixelFormat == d.pixelFormat
         && !mrb_pending(c->dst->serial) && tex_storage_src(c->src) && !nvn_tex_mirror_t2t(c->src, sl, sz0, &c->sr, c->dst, dl, dz0, &c->dr)) { mirror_note(0, c->dst, dl, "texture", 0); rb = 0; }
     // The draw path renders into the destination: one made without render-target use (packaged) gets it first, as a whole-level clear does (Paper Mario: The Thousand-Year Door copies a
@@ -12433,6 +12448,7 @@ static void dlss_eval(const p_dlss *c) {
     if (!e) {
         NVNcopyRegion sr = {c->base[DLSS_COLOR][0], c->base[DLSS_COLOR][1], 0, (int)iw, (int)ih, 1}, dr = {c->base[DLSS_OUTPUT][0], c->base[DLSS_OUTPUT][1], 0, (int)out.width, (int)out.height, 1};
         if (!(out.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(out.pixelFormat) && !fmt_int_or_ds(out.pixelFormat)) out = tex_upgrade(c->tex[DLSS_OUTPUT], out, MTLTextureUsageRenderTarget, out.pixelFormat);
+        tex_gpu_mark(c->tex[DLSS_OUTPUT]);
         if (!copy_t2t_draw(col, out, 0, 0, 0, 0, &sr, &dr, 1, 0)) { static int once; if (!once++) MLOG("[RED] DLSS: the bilinear stand-in could not draw format %lu into format %lu", (unsigned long)col.pixelFormat, (unsigned long)out.pixelFormat); }
         return;
     }
@@ -12499,6 +12515,7 @@ static void clear_tex(const p_clear_tex *c) {
     int is3d = t.textureType == MTLTextureType3D, nz = c->r.depth ? c->r.depth : 1;
     if (!(t.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(t.pixelFormat) && t.sampleCount == 1)
         t = tex_upgrade(c->tex, t, MTLTextureUsageRenderTarget, t.pixelFormat);   // a clear of a texture made without render-target use (packaged): give it that use
+    tex_gpu_mark(c->tex);
     if (c->has_view && c->view.set_format) {   // View with changed format: the clear value is interpreted in the view format (all 5 of the game's calls are the ui version with an integer view), and the clear is done on a view of the same format
         uint32_t vpf = 0; uint8_t swz[4];
         if (!nvn_fmt_to_mtl(c->view.format, &vpf, swz) || !vpf) { RED_ONCE(42, "texture clear view format %#x has no equivalent", c->view.format); return; }

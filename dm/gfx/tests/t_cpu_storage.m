@@ -80,6 +80,26 @@ int main(void) {
             CHECK(left_out[i].label, !tex_cpu_content(&f.t));
             teardown(&f);
         }
+
+        // Filled by the CPU after its first use (Ocarina of Time's terrain tiles): the texture was made as a GPU texture of zeros, with the render-target use tex_desc gives every
+        // uncompressed texture. That use is no GPU write, so the texture is not GPU-owned, and the CPU write nvn_ft_poll finds (tex_dirty_upload) makes it CPU-written and uploaded.
+        // Once the GPU has drawn into one, it is GPU-owned and keeps what was drawn
+        setup(&f, 7020, CACHED, NVN_FORMAT_RGBA8, 0);
+        mtl_tex_init(&f.t);
+        id<MTLTexture> zero = resolve(&f.t);
+        CHECK("first used before the CPU filled it: a GPU texture of zeros", zero && first_red(zero) == 0 && (zero.usage & MTLTextureUsageRenderTarget));
+        CHECK("its default render-target use is not GPU ownership", !mtl_tex_gpu_owned(f.t.serial));
+        fill(&f.t, f.mem, 60);
+        if (!mtl_tex_gpu_owned(f.t.serial)) mtl_tex_cpu_written(&f.t);   // what nvn_ft_poll does with a texture whose pages the CPU wrote
+        CHECK("the CPU's fill after the first use is uploaded", first_red(resolve(&f.t)) == 60);
+        teardown(&f);
+
+        setup(&f, 7021, CACHED, NVN_FORMAT_RGBA8, 0);
+        mtl_tex_init(&f.t);
+        resolve(&f.t);
+        mtl_sub_begin(); MTLRenderPassColorAttachmentDescriptor *ca = [MTLRenderPassColorAttachmentDescriptor new]; attach(ca, &f.t, NULL, 0); finish();
+        CHECK("a texture the GPU drew into is GPU-owned", mtl_tex_gpu_owned(f.t.serial));
+        teardown(&f);
     }
     printf("t_cpu_storage: %d checks, %d failed\n", checks, failed);
     return failed != 0;
