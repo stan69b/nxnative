@@ -5320,11 +5320,15 @@ static void treg_drop_pool_views(const void *pool) {
 // memory may name any registered texture, and only the GPU knows which, so without this every texture had to be made in case it is read (pool_gpu)
 enum { POOL_SEEN_WORDS = (1u << 20) / 32 };
 static __strong id<MTLBuffer> g_seen_buf; static uint32_t g_seen_done[POOL_SEEN_WORDS]; static uint64_t g_seen_sub = ~0ull;
+static uint32_t g_seen_todo[POOL_SEEN_WORDS];   // IDs to make at the next scan (pool_seen_scan)
 static inline int pool_seen(int id_) { return id_ >= 0 && (g_seen_done[(unsigned)id_ >> 5] >> (id_ & 31) & 1); }
-// An ID given another texture has not been read as that texture
+// An ID given another texture has not been read as that texture. But shaders read the ID, so they most likely read its new texture too (a material's slot given its next texture): it is
+// made at the next submission's scan, as a reported read is, instead of reading the dummy until the GPU reports a read of it. Ocarina of Time re-registers 1 to 10 read IDs per 300 frames
+// (up to 90 MB), which read the dummy for 2-3 frames each time. The ID still counts as read only once the GPU reports it
 static void pool_seen_clear(int id_) {
     if (id_ < 0 || id_ >= (int)(POOL_SEEN_WORDS * 32)) return;
     uint32_t b = 1u << (id_ & 31);
+    if (g_seen_done[(unsigned)id_ >> 5] & b) g_seen_todo[(unsigned)id_ >> 5] |= b;
     g_seen_done[(unsigned)id_ >> 5] &= ~b;
     if (g_seen_buf) atomic_fetch_and((_Atomic uint32_t *)g_seen_buf.contents + ((unsigned)id_ >> 5), ~b);
 }
@@ -8123,7 +8127,6 @@ static uint64_t pool_seen_gpu(void) {
 }
 // Newly read IDs also go into the existing tables in place, as past POOL_SUB_MS of walks a submission a table stands: dummy → texture is safe for a draw already encoded, which only reads the right
 // texture sooner. At most POOL_REQ_BYTES of new textures a frame; the rest wait in g_seen_todo. Caller holds g_rmu
-static uint32_t g_seen_todo[POOL_SEEN_WORDS];
 static uint64_t g_fb_split_pool; static int g_fb_dread_pool;   // the passes ended because a pool shader that may read the depth attachment came before a depth write: if a later area reads its main depth through a pool, this counts what that costs
 // The depth and stencil textures shaders have read through a pool, from the bitmap at each submission, by what makes them one Metal texture (alias_key): a pool shader may name any registered texture, and a game can keep its depth attachment in the very pool the draw reads,
 // so what the pool could hold says nothing; fb_prepare asks this whether a draw can have read the depth attachment it would otherwise have to end the pass for

@@ -122,6 +122,18 @@ int main(void) { @autoreleasepool {
         CHECK("a read render target no pass wrote stays the dummy", e2[303] == dummy);
         os_unfair_lock_unlock(&g_rmu); finish();
         mtl_reg_tex(301, &un, NULL); CHECK("an ID given another texture has not been read", !pool_seen(301));
+        // ...but shaders read the ID, so they will most likely read its new texture too (Ocarina of Time re-registers 1 to 10 read IDs per 300 frames): it is made at the next
+        // submission, before the GPU reports a read, and the ID still waits for that report to count as read
+        {
+            __unsafe_unretained id<MTLBuffer> tb3 = nil;
+            mtl_sub_begin(); os_unfair_lock_lock(&g_rmu);
+            pool_gpu(0, MTLTextureType2D, 0, 0, &tb3);
+            const uint64_t *e3 = (const uint64_t *)((const uint8_t *)tb3.contents + DMSH_POOL_HEAD);
+            CHECK("a new texture at an ID shaders read is made before its read is reported", e3[301] != dummy);
+            CHECK("and the ID is not counted as read", !pool_seen(301));
+            CHECK("an unwritten render target still stays the dummy", e3[303] == dummy);
+            os_unfair_lock_unlock(&g_rmu); finish();
+        }
         mtl_reg_tex(301, NULL, NULL); mtl_reg_tex(302, NULL, NULL); mtl_reg_tex(303, NULL, NULL); mtl_tex_release(&rd); mtl_tex_release(&un); mtl_drain(); hog = nil;
     }
     // The write log: one bit an entry, and the host learns the range of the entry the bit names, from the table the shader used
