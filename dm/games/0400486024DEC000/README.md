@@ -52,6 +52,20 @@ Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk
 - Why so much: the game's own memory is about the console's 9 GB application pool, and on the Mac its textures also exist as Metal textures, as Metal cannot sample the guest's block-linear storage.
 - Open: render targets that move in the game's pool and change size with its dynamic resolution (1580 → 1579 → 1578 …) get a new Metal texture each time, about 2 GB added to the residency set per 300 frames. It costs about 0.5 ms a frame once settled, so recycling them is a smaller win than the walk, but [a report of a GPU driver panic](https://github.com/seedds/nxnative/pull/1299) lines up with this churn.
 
+### For an iPhone or iPad build
+
+Not built or run yet; this is what an iOS build would have to cut, from the Mac numbers above. iOS has no swap, and an app gets only part of the device's memory even with the increased-memory-limit entitlement: Mario Kart World's iPhone run had a 6,143 MiB limit on a 12 GB iPhone ([guest block in sparse files](../../../docs/reference/memory.md)). The Mac's 11 GB resident is about 6.4 GB of guest memory, 3.8 GB of Metal textures and targets and 1 GB of IOAccelerator memory, so a 12 GB device needs about half of it gone and an 8 GB one more.
+
+Candidates, none tried:
+- **Handheld mode.** The game renders its scene smaller in handheld mode (GPU p50 25 ms against 29 ms docked on an M4 Pro, aCidcOde in [issue 1326](https://github.com/seedds/nxnative/issues/1326#issuecomment-6670563063)); its targets are part of the 3.8 GB. The memory it saves is not measured.
+- **Render targets aliased as in the game's pool.** The game describes the storage of one GPU-only pool (flags 0x2a1) as many render targets: walking in Link's house, 5,409 new Metal textures (23.7 GB in all) in 3,300 frames, all COMPRESSIBLE 2D targets of 543 descriptions over 819 offsets. On NVN they share the pool's memory; here each description at each offset is a Metal texture of its own. A Metal placement heap that mirrors the pool, with textures at overlapping offsets aliasing, would bound the targets by the pool's size and remove the churn in the Open item above. `image_texture` already does this for one case (resolution families at one offset); the work is mapping NVN offsets to Metal's sizes and alignments. Keeping evicted targets for reuse instead was tried on oot-clean and made the walk slower there: it kept 370 MB more, and both of its runs fell to about 62 ms a frame against 28 ms without it (stan69b/nxnative a3df77e4; measured with the `GPU allocated` figure, which reads high on this game, see the Memory notes above).
+- **Guest pages the CPU cannot read.** A CPU_NO_ACCESS pool's textures exist twice, in guest memory and as Metal textures, which costs twice on iOS. Releasing those guest pages after upload saves memory only where no shader reads the range as raw global memory ([textures made only when read](../../../docs/reference/memory.md#shaders-report-which-textures-they-read-through-a-pool) lists why it is not done).
+- **Smaller textures on small devices.** Skipping the largest mip level of large streamed textures takes each to about a quarter, at a visible cost; a profile key for small devices, general.
+- **Block-compressed textures kept compressed.** To check on the device: a format it cannot sample, decompressed to RGBA8, takes 4 to 8 times the memory.
+- **The guest's 6.2 GB heap.** Only the pages it touches count; `mem_map_limit` gives freed ones back. How much of it the game dirties is not measured.
+
+First step for an iOS build: a `vmmap -summary` / `footprint` split of a long Mac run, then the aliasing above, which also helps the Mac.
+
 ## Saves
 
 The game autosaves into `slot_00` and `slot_01`, with `option.sav` and `account.sav`. The Load screen lists them and reloading works. A save's thumbnail is a 543x306 JPEG in `caption.sav`, made from a copy of a texture to a buffer. A manual save (Menu, System, Save) on the current build has the picture (slot 02, mean colour 138 / 123 / 86). The autosaves in the work folder's saves, made on older chains, hold a black one. Open: an autosave made on the current build has not been looked at.
@@ -73,7 +87,7 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - `nn::codec AV1: a packet refused with 12 pictures waiting` (4 lines a run): the decoder's queue is full and the game retries; movies play.
 - The `pipeline archive` red line is [issue 342](https://github.com/seedds/nxnative/issues/342), a limit of this system build. `c1_full.tsv is stale` holds on partial libraries, which no full build has stamped.
 - The "Navi" name label in the Great Deku Tree scene was missing on an earlier chain and has not been checked since. Not played yet: the Deku Tree dungeon, combat, later areas. Sound opens with no red line; movies and speech were not listened to. Physics issues reported in PR 1299 were not seen on this route (walking, the ladder, the camera).
-- No iOS shader build or iPhone run has been done. Its memory use makes an iPhone unlikely as it stands.
+- No iOS shader build or iPhone run has been done. Its memory use makes an iPhone unlikely as it stands: [what an iOS build would have to cut](#for-an-iphone-or-ipad-build).
 
 ## Found on this game
 
