@@ -37,10 +37,13 @@ The game steps its world one 1/60 s step a frame: agl's interval controller hold
 |---|---|---|---|---|---|
 | Kokiri Forest | before | 29.5 | 34.2 / 42.2 / 115 | 34.4 | 0.49 |
 | | frame step | 21.8 | 49.1 / 54.0 / 196 | 38.4 | 0.96–0.98 |
+| | and the [draw-count GPU reference](../../../docs/reference/frame-rate.md#a-gpu-reference-taken-on-a-loading-screen) | 19.0 | 49.9 / 54.4 / 2,002 | 42.4 | 0.95 |
+| | the same, capped at 30 (`DM_FPS_TARGET=30`) | 21.0 | 40.7 / 71.9 / 1,574 | 40.2 | 0.92–0.94 |
 | Link's house | before | 47.4 | 21.4 / 25.1 / 98 | 21.4 | 0.79 |
 | | frame step | 27.2 | 33.6 / 51.1 / 122 | 24.8 | 0.98–1.00 |
+| | and the [draw-count GPU reference](../../../docs/reference/frame-rate.md#a-gpu-reference-taken-on-a-loading-screen) | 24.2 | 36.3 / 51.8 / 73 | 24.7 | 0.98–1.00 |
 
-- Current: game speed is right. Outdoors on this Mac 30 fps does not hold: the GPU time is above 33.3 ms, so the host holds most frames 3 vsyncs (20 fps). In the house the GPU time at 30 fps is p50 25.5 / p90 32.6 ms, at the edge of its 33.3 ms, so a burst of heavy frames steps to 20 fps and the trial back to 30 waits for 30 frames in a row under 28.3 ms, which the GPU, clocked down at 20 fps, reaches only now and then. Open: GPU time (next section's measurements are an M6's).
+- Current: game speed is right. Outdoors on this Mac 30 fps does not hold: the GPU time is above 33.3 ms, so the host holds most frames 3 vsyncs (20 fps). The GPU takes longer the longer frames are held, as macOS lowers its clock while the game waits (34 ms a frame flat out at interval 1, 40 at hold 2 under a 30 cap, 42 at hold 3); under a 30 cap every frame is late and the payback keeps game time at 0.92–0.94. In the house the GPU time at 30 fps is p50 25.5 / p90 32.6 ms, at the edge of its 33.3 ms, so a burst of heavy frames steps to 20 fps and the trial back to 30 waits for 30 frames in a row under 28.3 ms, which the GPU, clocked down at 20 fps, reaches only now and then. Open: GPU time (next section's measurements are an M6's).
 - The frame step was first proven by hand: `DM_CTL` `poke` set the controller to interval 2 in a running game, and its game-frame counter advanced 60.1 frames a second at 30 fps against 43.9 at about 44 fps.
 
 ### Measured on an M6
@@ -134,3 +137,4 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - [An uncompressed texture the CPU filled after its first use stayed zeros](../../../docs/reference/memory.md#an-uncompressed-texture-the-cpu-filled-after-its-first-use-stayed-zeros): the holes of sky in Kokiri Forest's ground.
 - [A game paused out of focus looks hung before its first picture](../../../docs/reference/services.md#a-game-paused-out-of-focus-looks-hung-before-its-first-picture)
 - [agl's interval controller: a world stepped by a fixed present interval](../../../docs/reference/frame-rate.md#agls-interval-controller-a-world-stepped-by-a-fixed-present-interval): Link at half speed at 27–32 fps.
+- [A GPU reference taken on a loading screen](../../../docs/reference/frame-rate.md#a-gpu-reference-taken-on-a-loading-screen): 32 failed probes of 60 fps in a 120 s walk.
