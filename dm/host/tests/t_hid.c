@@ -43,6 +43,7 @@ void dm_gfx_texlist(int target) { (void)target; }
 void dm_gfx_restop(void) {}
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 void dm_ctl_peek(uint64_t a, int n) { (void)a; (void)n; }
+void dm_ctl_poke(uint64_t a, const uint32_t *v, int n) { (void)a; (void)v; (void)n; }
 void crash_dump_now(const char *why) { (void)why; }
 void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path) { (void)a; (void)n; (void)path; }
 void dm_ctl_cvar_i32(uint64_t off, int32_t v) { (void)off; (void)v; }

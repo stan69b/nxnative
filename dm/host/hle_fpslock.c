@@ -334,6 +334,16 @@ void dm_ctl_peek(uint64_t a, int n) {
         LOG("DM_CTL: peek %#llx: %g %g %g %g (%08x %08x %08x %08x)", (unsigned long long)(a + 4 * (uint64_t)i), f[0], f[1], f[2], f[3], w[0], w[1], w[2], w[3]);
     }
 }
+// "poke <guest address> <word> [<word> ...]": up to 16 32-bit words (hex) into guest memory from that address, each checked readable first, to change a game's state while it
+// runs (a frame-rate controller's interval, to see what follows it); the log shows each old and new word
+void dm_ctl_poke(uint64_t a, const uint32_t *v, int n) {
+    for (int i = 0; i < n && i < 16; i++) {
+        uint64_t at = a + 4 * (uint64_t)i; uint32_t old;
+        if (!rd(at, &old, sizeof old)) { LOG("DM_CTL: poke %#llx: not readable", (unsigned long long)at); return; }
+        uint32_t *p = (uint32_t *)(uintptr_t)at; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, v[i], __ATOMIC_RELAXED);
+        LOG("DM_CTL: poke %#llx: %08x → %08x", (unsigned long long)at, old, v[i]);
+    }
+}
 // "memdump <guest address> <bytes> <path>": guest memory to a file, read safely (stops at the first unreadable page)
 void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path) {
     FILE *f = fopen(path, "wb"); if (!f) { LOG("[RED] DM_CTL: memdump: cannot open %s", path); return; }
