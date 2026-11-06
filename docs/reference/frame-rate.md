@@ -344,6 +344,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 
 ## CPU cost and pacing
 
+### Indirect mesh draws on the encode thread
+
+- **Symptom:** with Metal encoding on its own thread (`DM_NVN_ENC_THREAD=1`, profile `enc_thread on`) a game that draws task / mesh shaders indirectly stops at its first such draw: `FATAL deferred encoding: DmRecEnc has no stand-in for -drawMeshThreadgroupsWithIndirectBuffer:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+- **Cause:** the deferred encoder (`nvn_rec.h`) recorded direct mesh draws only; `nvn_geometry.inc` encodes the indirect form when the draw's arguments come from GPU memory.
+- **Fix:** `RO_R_MESH_IND` records the indirect buffer's address and the thread counts and replays the call on the encode thread.
+- **Check:** Ocarina of Time on an M4 Air, two 64 s outdoor routes with the encode thread: no stop, 29.6 / 29.7 fps, frame p50 33.7 / 34.2 ms, the same as without it (27.1–31.7 fps over three runs): this GPU-bound game gains nothing from it here.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate).
+
 ### Arena buffer ownership on allocation
 
 - **Symptom:** autorelease work takes a measurable share of replay time, with temporary arena-buffer ownership traffic a few times per draw.
