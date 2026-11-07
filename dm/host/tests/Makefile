@@ -53,6 +53,7 @@ run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_to
 	$(B)/t_codec_video
 	$(B)/t_movie_avc
 	$(B)/t_nv
+	$(B)/t_vi_history $(QUIET)
 	$(B)/t_nfc
 	$(B)/t_motion
 	$(B)/t_motion_apple
@@ -63,6 +64,7 @@ run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_to
 	$(B)/t_motion_pro_mac
 	TMPDIR="$(abspath $(B))" $(B)/t_hid
 	$(B)/t_pad_hid
+	$(B)/t_pad_pro
 	$(B)/t_haptics
 	$(B)/t_haptics_apple
 	TMPDIR="$(abspath $(B))" $(B)/t_cheats $(QUIET)
@@ -193,6 +195,10 @@ $(B)/t_sf: t_sf.c ../hle_sf.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_sf.c
 $(B)/t_shared_font: t_shared_font.c ../hle_sdk16.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -Wno-frame-address -I.. $(GINC) -o $@ t_shared_font.c
+# nn::vi::ListFrameHistory: the SDK's FrameInfo, newest first, from the present queue's progress
+run: $(B)/t_vi_history
+$(B)/t_vi_history: t_vi_history.c ../../gfx/hle_vi.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_vi_history.c
 run: $(B)/t_nv
 $(B)/t_nv: t_nv.c ../../gfx/hle_nv.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_nv.c
@@ -360,6 +366,9 @@ tsan-threads-run: $(addprefix $(B)/,$(TSAN_T))
 	DM_QOS_MAP=1 $(B)/t_notify_sched --all-peers
 $(B)/t_pad_hid: t_pad_hid.c ../pad_hid.h ../dm_input.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_hid.c
+run: $(B)/t_pad_pro
+$(B)/t_pad_pro: t_pad_pro.c ../pad_pro.h ../dm_input.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_pro.c
 
 # Line coverage (../../sanitizers/coverage.mk): make coverage builds every test of run into $(B)/cov with COV_FLAGS, runs them and writes $(B)/cov/coverage.lcov.
 # It measures, it does not test: make -i runs every test even after one fails (the plain run reports that), so the coverage of the others is kept.

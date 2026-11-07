@@ -183,7 +183,7 @@ def nvn2_stage(ctl, code):   # an NVN2 shader's stage: compute, task and mesh by
 def bahs_shaders(d, label):
     rsz, region = field(d, '<II', 0x18, f'{label} BAHS header')
     if region + rsz > len(d): red(f'{label} BAHS code region out of bounds')
-    out = []
+    found = []
     for a in range(0, region - 16, 4):
         off, z, csz, rel = struct.unpack_from('<IIIi', d, a)
         nvn2 = 0x48 <= csz < 0x10000 and 0 <= a + rel and a + rel + csz <= region and nvn2_ctl(d[a + rel:a + rel + csz])
@@ -196,7 +196,13 @@ def bahs_shaders(d, label):
         code, ctl = d[region + off:region + off + n], d[c:c + csz]
         st = nvn2_stage(ctl, code) if nvn2 else 'cs' if code[:4] == CS_MAGIC else sph_stage(code) if code[:4] == GFX_MAGIC else None
         if not st or check(label, st, ctl, code): continue
-        out.append((f'{label}#BAHS@{a:#x}', st, ctl, code))
+        found.append((a, c, (f'{label}#BAHS@{a:#x}', st, ctl, code)))
+    # A program entry never lies inside a control section. An NVN2 section's +0x38..+0x47 (instruction length, c1 start and end, code length: 0x1100, 0, 0x1100, 0x1100) reads as
+    # an entry whose offset, control length and control distance are all that length: Ocarina of Time's agl_common.sharcb@0x357f0 paired compute shader 30's control with a vertex
+    # shader's code, a shader the game never loads, and its SPH came to the translator as an instruction ("Ampere instruction 481 at 0x0"). Each section counts with its own
+    # length (ctl_len), not the length an entry gives it, which for such a false entry covers real entries after it
+    spans = {(c, c + ctl_len(s[2])) for _, c, s in found}
+    out = [s for a, _, s in found if not any(lo <= a < hi for lo, hi in spans)]
     bahs_variations(d, label, [o[0] for o in out])
     return out
 
@@ -225,7 +231,9 @@ def ndsr_shaders(d, label):
     records point at control sections. Read from +0x10 the same pack gave no shader, the upscaler's draws were skipped and every 3D frame reached the window black"""
     if d[:4] != b'NDSR' or len(d) < 0x20: return []
     def records_from(o):   # how many of the first records point at an NVN2 control section
-        return sum(1 for c, cl, _, _ in struct.iter_unpack('<4I', d[o:o + 16 * 16]) if c + 0x48 <= len(d) and nvn2_ctl(d[c:c + 0x48]))
+        count = min(16, (len(d) - o) // 16)
+        records = struct.iter_unpack('<4I', d[o:o + 16 * count])
+        return sum(1 for c, _, _, _ in records if c + 0x48 <= len(d) and nvn2_ctl(d[c:c + 0x48]))
     out = []; o = max((0x10, 0x14), key=records_from); prog = None
     while o + 16 <= len(d):
         c, cl, k, _ = struct.unpack_from('<4I', d, o)
@@ -2888,13 +2896,14 @@ def ue_shaders(d, label):
     return out
 
 def var_pairs(found):
-    """(vertex key, pixel key) within the same BNSH variation; (vertex key, pixel key, 'prog') within the same BAHS program variation (bahs_variations).
-    The tables stay separate; dmsh_build.py pads against both, as the pipeline prebuild uses both."""
+    """(vertex or mesh key, pixel key) within the same BNSH variation; (vertex key, pixel key, 'prog') within the same BAHS program variation (bahs_variations).
+    The tables stay separate; dmsh_build.py pads against both, as the pipeline prebuild uses both. A mesh shader is the stage before the pixel shader as a vertex shader is
+    (NVN2: Ocarina of Time's foliage meshes leave locations unwritten that their pixel shaders read, which dmsh_meshstage.to_stage pads)."""
     var = collections.defaultdict(dict)
     for where, st, ctl, code in found:
         g = where if '#var' in where else BAHS_VAR.get(where)
         if g: var[g][st] = skey(ctl, code)
-    return {(v['vs'], v['ps']) + (('prog',) if '#BAHS#prog' in g else ()) for g, v in var.items() if 'vs' in v and 'ps' in v}
+    return {(v[st], v['ps']) + (('prog',) if '#BAHS#prog' in g else ()) for g, v in var.items() for st in ('vs', 'ms') if st in v and 'ps' in v}
 
 def unreadable_why(e, name):
     why = str(e).removeprefix('[RED] ') if isinstance(e, SystemExit) else f'{type(e).__name__}: {e}'
