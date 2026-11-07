@@ -3,11 +3,12 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
+- [Game](#game): [Frame rate](#frame-rate), [Frame generation](#frame-generation), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
+- [Game menu on the Mac](#game-menu-on-the-mac)
 - [TV](#tv)
 - [Settings in a file](#settings-in-a-file)
 
@@ -25,7 +26,13 @@ A Mac app carries the same list (`Contents/Resources/dm/launcher.json`), without
 
 Games whose speed the app controls (Breath of the Wild, Tears of the Kingdom and a few others) offer **30 fps** or **60 fps**. 60 is smoother; 30 is what the Switch ran and uses less power, so the phone stays cooler and the battery lasts longer. The game runs at real speed either way.
 
-On a Mac, a game checked at that speed (Fire Emblem Fortune's Weave, Mario & Luigi: Brothership) also offers **120 fps**. It needs a screen that shows 120 Hz, and uses more GPU and power. When frames do not fit, during movies, or on a slower screen, the game drops to 60 for a while, so it keeps its real speed. If you see the frame rate move between 60 and 120 and would rather it stayed still, choose 60.
+On a Mac, a game checked at higher speeds (Fire Emblem Fortune's Weave, Mario & Luigi: Brothership) also offers **Unlimited**: as fast as the screen shows, up to 120 fps. It needs a screen that shows 120 Hz to go past 60, and uses more GPU and power. When frames do not fit, during movies, or on a slower screen, the game drops to 60 for a while, so it keeps its real speed. If you see the frame rate move between 60 and 120 and would rather it stayed still, choose 60. Other games stop at 60, because they move in steps of 1/60 s (Ocarina of Time, Breath of the Wild), and faster frames would make the game itself run faster.
+
+On a Mac the game window's **Game** menu changes the frame rate while you play ([Game menu on the Mac](#game-menu-on-the-mac)).
+
+### Frame generation
+
+On a Mac, **MetalFX** adds a picture between frames the game holds for two refreshes, so a game at 30 fps puts 60 pictures a second on screen. Apple's MetalFX frame interpolator makes it from the frames before and after. Each real frame then shows one refresh (16.7 ms) later. It uses GPU time, which a game already short of it no longer has, and it sees only the picture's colours: fast motion can smear, and the HUD moves with what is under it. **Blend** mixes the two frames half and half, to check the timing; it is not for playing. **Off**, the default, shows the frames as the game makes them. At 60 fps nothing changes, since no frame is held for two refreshes. The Game menu offers it only on a Mac whose GPU has MetalFX's frame interpolator. Chosen in the settings window on another Mac, MetalFX blends instead.
 
 ### Render scale
 
@@ -85,7 +92,7 @@ Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizo
 
 ### Frame-rate counter
 
-Shows the frames per second at the top left. On the Mac it also shows the longest frame of the last second (a freeze shows there) and the GPU time per frame; **Window > Frame-Rate Counter** turns it on and off while the game runs.
+Shows the frames per second at the top left. On the Mac it also shows the longest frame of the last second (a freeze shows there) and the GPU time per frame; **Game > Frame-rate counter** turns it on and off while the game runs.
 
 ## Controls
 
@@ -240,6 +247,22 @@ iCloud Drive takes a moment to carry a file from one device to the other. Quit t
 On the iPhone and iPad the gear at the top centre of the touch controls opens a menu while the game runs; it stays when a controller hides the other controls. It holds **Console mode**, **Picture** and the **Frame-rate counter**, then **Controller layout** (**2D**, **3D**, and **Tap**, no controls and every touch to the game, in handheld mode), **Touch feedback** and **Game rumble**: the settings that take effect at once. A choice opens to show its options, the current one ticked. The menu's text keeps one size whatever the system text size, so it stays short over the game. A change is remembered as on the settings screen, which shows it at the next start; a setting `Documents/env.txt` fixes is shown, not changed. The other settings need the game to start again, so they are only on the settings screen: close the app fully and open it again.
 
 Console mode changes as on a Switch put in or taken out of its dock. While a TV shows the game it stays **Docked**, and the mode you pick applies when the TV is disconnected. **Docked** removes the Tap layout, as a docked Switch reads no touch screen.
+
+On a Mac, the game window's **Game** menu holds the settings that take effect at once ([Game menu on the Mac](#game-menu-on-the-mac)).
+
+## Game menu on the Mac
+
+While the game runs, the **Game** menu in the menu bar, between **Cheats** and **Window**, holds the settings that take effect at once, as far as the game has them:
+
+- **Frame rate**: **30 fps**, **60 fps**, and **Unlimited** for a game that offers it ([Frame rate](#frame-rate)). Only games whose speed the app controls have it. The game keeps its real speed.
+- **Frame generation**: **Off**, **MetalFX** or **Blend** ([Frame generation](#frame-generation)), on a Mac whose GPU has MetalFX's frame interpolator.
+- **Console mode**: **Docked** or **Handheld**, as on a Switch put in or taken out of its dock.
+- **Upscaling**: **Standard** or **MetalFX** ([Upscaling](#upscaling)), on a Mac whose GPU has MetalFX's upscaler.
+- **Frame-rate counter**: on or off.
+
+A choice opens to show its options, with the current one ticked. An option the game cannot take now is greyed out. Your pick applies at once and is remembered as a choice in the [settings window](#the-mac-settings-window), so the next start begins where you left off; picking the tested default again forgets it. A setting an `env.txt`, or the program that started the app, fixes shows "(set in env.txt)" and does not change.
+
+The other settings take effect only when the game starts: **Render scale**, **Game's upscaler**, **Game language**, **Display mode** (the green button or ⌃⌘F changes the window itself while you play), rumble, and everything under **Performance**. Quit the game (⌘Q) and open the app again to change them in the settings window; hold Option while the app opens if the window is turned off.
 
 ## TV
 

@@ -3,7 +3,8 @@
 // and so is the store: launcher.<VAR> in the app's preferences, which launcher.c reads when the window is not shown (docs/frontends.md, Saved choices). Basic settings (level basic) come
 // first, the others under Advanced settings, each in the list's sections. Play puts the settings into this process's environment, which the host inherits; Quit and closing the window end the
 // app without the game. "Show this window at launch" off: no window unless Option is held at launch, and launcher.c applies the saved choices. The window never takes focus by itself: an app
-// opened in the background (open -g) keeps its window behind until the player switches to it
+// opened in the background (open -g) keeps its window behind until the player switches to it. The game window's Game menu (dm/host/front_mac.m choice_save) writes the same
+// launcher.<VAR> keys while the game runs, by the same rule (only a choice that differs from the default), so this window opens with the player's last pick
 import AppKit
 import QuartzCore
 import SwiftUI

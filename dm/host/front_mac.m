@@ -583,7 +583,8 @@ bool dm_setting_live(const char *env, const char *value) {
 // list's order: a choice as a submenu of its options, the current one ticked, an option the game cannot take now greyed out; a toggle as one item. The list is the app's
 // <modules folder>/launcher.json (the host's first argument: Contents/Resources/dm in a Mac app); a run without one (outside an app) has the frame-rate counter only. Rebuilt
 // each time it opens, so it shows what the game runs with (the frame rate appears once NVN presents). A setting an env file or the launch environment fixed (launcher.c's
-// DM_ENV_FILE_KEYS, DM_ENV_LAUNCH_KEYS) is shown, not changed. A pick applies at once, and goes into the environment, as the iPhone's in-game menu does
+// DM_ENV_FILE_KEYS, DM_ENV_LAUNCH_KEYS) is shown, not changed. A pick applies at once, goes into the environment and is saved as the player's choice (choice_save), as the
+// iPhone's in-game menu does
 static NSArray<NSDictionary *> *live_rows(void) {
     static NSArray<NSDictionary *> *rows; if (rows) return rows;
     NSArray<NSString *> *args = NSProcessInfo.processInfo.arguments;
@@ -618,6 +619,20 @@ static BOOL option_ok(NSString *env, NSString *v) {   // an option the running g
     if ([env isEqual:@"DM_PRESENT_UPSCALE"] && [v isEqual:@"metalfx"]) return mtl_present_upscale_ok(1);
     return YES;
 }
+// A pick kept for the next start (docs/frontends.md, Saved choices): launcher.<VAR> in the app's preferences domain (its bundle ID), the store the Mac settings window
+// (dm/mac/Launcher.swift) shows and launcher.c reads when it is not shown, so the next launch starts as the player left it. As Play keeps them, only a choice that differs from
+// the tested default (the list's default) is kept; picking the default again removes it. Kept for this run only: outside an app (no bundle ID) and with DM_SAVED_CHOICES=0
+// (a start with the tested defaults leaves the saved choices as they are)
+static void choice_save(NSDictionary *s, NSString *v) {
+    NSString *domain = NSBundle.mainBundle.bundleIdentifier, *env = s[@"env"];
+    const char *off = getenv("DM_SAVED_CHOICES");
+    if (!domain || (off && !strcmp(off, "0"))) { LOG("front end: %s=%s for this run only (%s)", env.UTF8String, v.UTF8String, domain ? "DM_SAVED_CHOICES=0" : "not started from an app"); return; }
+    CFStringRef key = (__bridge CFStringRef)[@"launcher." stringByAppendingString:env], app = (__bridge CFStringRef)domain;
+    BOOL dflt = [v isEqual:str_or(s[@"default"], @"")];
+    CFPreferencesSetAppValue(key, dflt ? NULL : (__bridge CFStringRef)v, app);
+    if (!CFPreferencesAppSynchronize(app)) { LOG("[RED] front end: %s=%s could not be saved in %s", env.UTF8String, v.UTF8String, domain.UTF8String); return; }
+    LOG("front end: %s=%s %s (%s)", env.UTF8String, v.UTF8String, dflt ? "is the tested default: the saved choice is removed" : "saved for the next start", domain.UTF8String);
+}
 @interface DmGameMenu : NSObject <NSMenuDelegate> @end
 @implementation DmGameMenu
 - (void)menuNeedsUpdate:(NSMenu *)menu {
@@ -648,7 +663,7 @@ static BOOL option_ok(NSString *env, NSString *v) {   // an option the running g
 - (void)pick:(NSMenuItem *)it {
     NSDictionary *s = it.representedObject[0]; NSString *env = s[@"env"], *v = it.representedObject[1];
     if (setting_fixed(env) || !dm_setting_live(env.UTF8String, v.UTF8String)) return;   // dm_setting_live logged why
-    setenv(env.UTF8String, v.UTF8String, 1);
+    setenv(env.UTF8String, v.UTF8String, 1); choice_save(s, v);
 }
 @end
 static DmGameMenu *g_game_menu;   // NSMenu keeps its delegate unretained
