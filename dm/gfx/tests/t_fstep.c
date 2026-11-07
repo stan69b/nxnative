@@ -339,8 +339,8 @@ int main(void) {
                 nvn_fstep_next(&s, ms * 60 / 1000, 0.6, 1, 3, 0, 0);
             }
             snprintf(b, sizeof b, sl ? "165 Hz, cheap frames at hold 3, one refresh of slack: trials back to 2 and 1 (k %d, downs %llu)"
-                                     : "  without the slack the 54.5 ms frames count as late: hold 3 (20 fps) for good (k %d, downs %llu)", s.k, (unsigned long long)s.downs);
-            check(sl ? s.k == 1 && s.downs == 2 : s.k == 3 && s.downs == 0, b);
+                                     : "  without the slack the 36.4 / 54.5 ms frames count as late: never back to hold 1 (k %d, downs %llu)", s.k, (unsigned long long)s.downs);
+            check(sl ? s.k == 1 && s.downs == 2 : s.k == 2 && s.downs == 1, b);   // hold 3's cheap frames fill under FSTEP_OCC of it: the probe to hold 2 (nvn_fstep_occ) holds
         }
         sim m = {0}; m.s.shown_slack = 60.0 / 165; run(&m, 60, 0.5, 1, 3, 0); run(&m, 300, 1.32, 1, 3, 0);
         check(m.s.k == 2, "  the slack does not hide work: 22 ms frames still step to hold 2");
@@ -383,6 +383,49 @@ int main(void) {
             snprintf(b, sizeof b, what[c], first_len, (unsigned long long)m.s.failed);
             check(first_len == want[c] && m.s.k == 2 && m.s.failed == 1, b);
         }
+    }
+    {   // Ocarina of Time in Link's house on an M4 Air (2026-11-06): at hold 2 its frames cost 1.34-1.99 vsyncs (p50 1.59, 26.5 ms), and every 50 s a burst of three heavy frames
+        // (2.3) steps it up to hold 3, where the GPU clock falls and the same frames cost 4% more (p50 1.63 there): one frame in five above FSTEP_FIT * 2 (1.7), so never 30 in a
+        // row, and it stayed at 20 fps for 20-67 s at a time. A cost that fills under FSTEP_OCC of hold 3 starts a probe back to hold 2
+        static const double pat[10] = {1.34, 1.45, 1.50, 1.55, 1.59, 1.60, 1.65, 1.70, 1.85, 1.99};
+        sim m = {0}; run(&m, 600, 0.3, 1, 3, 0);   // the title and the loading screen at hold 1
+        int at3 = 0, n = 0, after = 0; uint64_t ups0;
+        for (int i = 0; i < 1500; i++) run(&m, 1, pat[i % 10] * (m.s.k >= 3 ? 1.04 : 1), 1, 3, 0);
+        ups0 = m.s.ups; int was2 = m.s.k == 2;
+        for (int burst = 0; burst < 5; burst++) {
+            run(&m, 3, 2.3, 1, 3, 0);
+            for (int i = 0; i < 1500; i++) { run(&m, 1, pat[i % 10] * (m.s.k >= 3 ? 1.04 : 1), 1, 3, 0); n++; at3 += m.s.k == 3; if (burst == 0 && m.s.k == 3) after = i + 1; }
+        }
+        snprintf(b, sizeof b, "OoT house, bursts at hold 2: back from hold 3 after each (%d frames the first time, at hold 3 %d of %d)", after, at3, n);
+        check(was2 && after > 0 && after < 120 && at3 < n / 20 && m.s.k == 2, b);
+        snprintf(b, sizeof b, "  one step up a burst, one probe back each, none failed (ups %llu, probes %llu, failed %llu)", (unsigned long long)(m.s.ups - ups0), (unsigned long long)m.s.probes, (unsigned long long)m.s.failed);
+        check(m.s.ups - ups0 == 5 && m.s.probes == 5 && m.s.failed == 0, b);
+        snprintf(b, sizeof b, "  game time %.0f against real time %.2f (debt %.2f, dropped %.0f)", m.game, m.real, m.s.debt, m.s.dropped);
+        check(m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01 && m.s.dropped == 0, b);
+    }
+    {   // the same house (2026-11-07) when hold 2 never held first: three late frames at the load step it to hold 3, where the clock lowered for 50 ms makes the same frames
+        // cost 38% more (p50 2.20, 73% of the hold; 1.94 in another run); at hold 2 the clock rises again and they cost what they did there. Before, it stayed at hold 3 for the whole two-minute walk
+        static const double pat[10] = {1.34, 1.45, 1.50, 1.55, 1.59, 1.60, 1.65, 1.70, 1.85, 1.99};
+        sim m = {0}; run(&m, 600, 0.3, 1, 3, 0); run(&m, 3, 3.7, 1, 3, 0);
+        int at3 = 0; for (int i = 0; i < 2400; i++) { run(&m, 1, pat[i % 10] * (m.s.k >= 3 ? 1.38 : 1), 1, 3, 0); at3 += m.s.k == 3; }
+        snprintf(b, sizeof b, "OoT house, hold 3 from the load at a cost of 73%% of it: one probe to hold 2 that holds (k %d, at hold 3 %d of 2400, probes %llu)", m.s.k, at3, (unsigned long long)m.s.probes);
+        check(m.s.k == 2 && at3 < 100 && m.s.probes == 1 && m.s.failed == 0, b);
+    }
+    {   // Kokiri Forest: hold 2 held at 1.2 for 30 s, then the scene costs 2.45 (41 ms, 82% of hold 3; p50 2.44 and 2.51 measured) at hold 3: the GPU fills the hold, no probe to hold 2
+        sim m = {0}; run(&m, 600, 0.3, 1, 3, 0); run(&m, 900, 1.2, 1, 3, 0); run(&m, 1500, 2.45, 1, 3, 0);
+        check(m.s.k == 3 && m.s.probes == 0 && m.s.downs == 0, "OoT outdoors, a heavier scene at hold 3 (2.45, 82% of it): hold 3, no probe");
+    }
+    {   // the cost at hold 3 (1.74, above FSTEP_FIT * 2, 58% of the hold), but hold 2 does not fit (2.3 there): each probe fails after its grace, and they spread out 1 → 2 → 4 → 8 s
+        sim m = {0}; double last = 0, gaps[5]; int ng = 0; uint64_t probes = 0;
+        run(&m, 600, 0.3, 1, 3, 0); run(&m, 900, 1.6, 1, 3, 0); run(&m, 3, 2.3, 1, 3, 0);
+        for (int i = 0; i < 8000 && ng < 5; i++) {
+            run(&m, 1, m.s.k == 2 ? 2.3 : 1.74, 1, 3, 0);
+            if (m.s.probes != probes) { probes = m.s.probes; gaps[ng++] = m.real - last; last = m.real; }
+        }
+        snprintf(b, sizeof b, "cost at hold 3 is 58%% of it, but hold 2 does not fit: probes fail (%llu of %llu)", (unsigned long long)m.s.failed, (unsigned long long)m.s.probes);
+        check(ng == 5 && m.s.failed >= 4, b);
+        snprintf(b, sizeof b, "  probes %.0f, %.0f, %.0f, %.0f vsyncs apart; game time %.0f against real time %.2f (debt %.2f)", gaps[1], gaps[2], gaps[3], gaps[4], m.game, m.real, m.s.debt);
+        check(gaps[1] >= 120 && gaps[2] >= 240 && gaps[3] >= 480 && gaps[4] >= 480 && gaps[4] < 640 && m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01, b);
     }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;

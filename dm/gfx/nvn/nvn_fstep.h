@@ -18,6 +18,10 @@
 // rise set k to kmin with no grace, so three frames late while the clock rose stepped up again, with cref dropped at the cap change and a GPU reference taken at the 30 fps
 // cap: neither the fit trial (a GPU-bound cost near FSTEP_FIT) nor a probe brought kmin back (t_fstep: the movie and thermal cap cases). A cref kept from before the cap
 // starts a probe only when the cost at the longer hold is within FSTEP_SAME of it, and a failed probe doubles the hold-off as any other does.
+// Between two longer holds (k − 1 above kmin) a cost that fills at most FSTEP_OCC of the hold starts a probe to k − 1 too: the clock was lowered for the hold. macOS lowers the GPU
+// clock of a game that meets its deadline until the frame's work is about 70% of the frame, so the cost at hold 3 says little about hold 2: Ocarina of Time in Link's house on an M4
+// Air held 30 fps at a cost of p50 1.59 vsyncs, and once at hold 3 its frames cost p50 1.63 to 2.20 (27 to 37 ms of 50), never 30 in a row under FSTEP_FIT * 2 (1.7): 20 fps for
+// 20 s to the whole of a two-minute walk. Outdoors, where hold 2 does not fit at any clock (34 ms a frame flat out), the cost at hold 3 fills 0.81-0.84 of it. The probe has its grace; a failed one doubles the hold-off, and the run at k − 1 must last FSTEP_HOLD_MAX, as for any probe.
 #pragma once
 #include <math.h>
 #include <stdint.h>
@@ -31,6 +35,7 @@
 #define FSTEP_HOLD_MAX 480.0
 #define FSTEP_GRACE 30        // a probe's first frames, whose lateness neither fails it nor counts toward a step up (the controller lowered the clock within 10 frames of a step to 30)
 #define FSTEP_SAME 1.1        // the cost at the longer hold against the cost that held kmin: at most this much is the same scene (BotW at hold 2: 1.0–1.07 times its hold-1 GPU time)
+#define FSTEP_OCC 0.78        // the share of a longer hold its cost may fill and still be a clock lowered for that hold (macOS: about 0.7; OoT at hold 3, M4 Air: house 0.65-0.73, outdoors 0.81-0.84)
 // The grace is renewed (nvn_fstep.ramp) while the probe's frames keep getting cheaper: a controller that raises the clock slowly is still raising it. macOS raises the GPU clock
 // of a game that misses its deadline at 85–100% GPU occupancy by about 100 MHz a second (Breath of the Wild on an M5 Pro: 338 → 432 MHz over a 33-frame probe, GPU 24.8 → 18.5 ms,
 // then the probe failed at 22 ms frames; hold 1 needs about 560 MHz there), where the iPhone's controller settles within the 30 frames. A window of FSTEP_GRACE frames whose
@@ -61,6 +66,8 @@ typedef struct {
 
 // Whether the cost at the longer hold is the cost that held kmin (a probe without a slowed report)
 static inline int nvn_fstep_same(const nvn_fstep *s) { return s->cref > 0 && s->cn >= FSTEP_RUN && s->ccur <= FSTEP_SAME * s->cref; }
+// Whether the cost at the longer hold fills at most FSTEP_OCC of it, with a hold above kmin below it (a probe to k − 1)
+static inline int nvn_fstep_occ(const nvn_fstep *s, int kmin) { return s->k - 1 > kmin && s->ck == s->k && s->cn >= FSTEP_RUN && s->ccur <= FSTEP_OCC * s->k; }
 
 // Once per frame. shown: real time since the previous frame's start, in vsyncs; cost: the frame's work, max(CPU, GPU), in vsyncs (a GPU that cannot keep up makes frames late too); kmin: 1 at a 60 fps cap, 2 at 30;
 // kmax: the longest hold (FSTEP_MAX; 2 at a 30 fps cap, where the display link runs at 30 Hz and holds only even counts); fixed: a step the game has set itself (BotW's
@@ -128,6 +135,8 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (s->fit_run >= FSTEP_RUN && s->since >= s->hold && !s->trial) { s->k--; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
         s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
+    } else if (nvn_fstep_occ(s, kmin) && s->since >= s->hold && !s->trial) {   // probe: to the hold below, as the clock fell with this one
+        s->k--; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
     }
     s->step = s->k + (s->debt >= 1 && s->k < FSTEP_MAX);
     s->paid += s->step > s->k;

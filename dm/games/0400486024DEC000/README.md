@@ -118,6 +118,7 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - [A pipeline archive on an external drive is read into memory](../../../docs/reference/memory.md#a-pipeline-archive-on-an-external-drive-is-read-into-memory): 3.5 GB of swapped memory, now mapped.
 - [A texture in a sparse pool came out CPU-written at its first use](../../../docs/reference/memory.md#a-texture-in-a-sparse-pool-came-out-cpu-written-at-its-first-use): found by the unit test, on this profile's `tex_dirty_upload`.
 - [`EventFd` needs no network](../../../docs/reference/services.md#eventfd-needs-no-network)
+- [A longer hold's lowered clock keeps a game at 20 fps](../../../docs/reference/frame-rate.md#a-longer-holds-lowered-clock-keeps-a-game-at-20-fps): Link's house at 20 fps for whole walks on an M4 Air.
 - [No virtual audio input devices (SDK 22)](../../../docs/reference/audio.md#no-virtual-audio-input-devices-sdk-22)
 - [`nn::ndve`'s movie enhancement file](../../../docs/reference/shaders.md#nnndves-movie-enhancement-file)
 - [Task and mesh shaders in BNSH, and indirect mesh draws](../../../docs/reference/shaders.md#task-and-mesh-shaders-in-bnsh-and-indirect-mesh-draws)
