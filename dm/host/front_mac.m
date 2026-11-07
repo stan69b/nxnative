@@ -579,6 +579,79 @@ bool dm_setting_live(const char *env, const char *value) {
     }
     return false;
 }
+// The Game menu: the settings list's live rows (dm/games/settings.tsv meta live=1, written by settings.py into launcher.json) that this host takes now (dm_setting_live), in the
+// list's order: a choice as a submenu of its options, the current one ticked, an option the game cannot take now greyed out; a toggle as one item. The list is the app's
+// <modules folder>/launcher.json (the host's first argument: Contents/Resources/dm in a Mac app); a run without one (outside an app) has the frame-rate counter only. Rebuilt
+// each time it opens, so it shows what the game runs with (the frame rate appears once NVN presents). A setting an env file or the launch environment fixed (launcher.c's
+// DM_ENV_FILE_KEYS, DM_ENV_LAUNCH_KEYS) is shown, not changed. A pick applies at once, and goes into the environment, as the iPhone's in-game menu does
+static NSArray<NSDictionary *> *live_rows(void) {
+    static NSArray<NSDictionary *> *rows; if (rows) return rows;
+    NSArray<NSString *> *args = NSProcessInfo.processInfo.arguments;
+    NSString *path = args.count > 1 ? [args[1] stringByAppendingPathComponent:@"launcher.json"] : nil;
+    NSData *d = path ? [NSData dataWithContentsOfFile:path] : nil;
+    id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    NSMutableArray *out = [NSMutableArray array];
+    id list = [j isKindOfClass:NSDictionary.class] ? j[@"settings"] : nil;
+    for (id s in [list isKindOfClass:NSArray.class] ? list : @[])
+        if ([s isKindOfClass:NSDictionary.class] && [s[@"live"] isEqual:@"1"] && [s[@"env"] isKindOfClass:NSString.class] && [s[@"label"] isKindOfClass:NSString.class]
+            && ([s[@"kind"] isEqual:@"toggle"] || ([s[@"kind"] isEqual:@"choice"] && [s[@"options"] isKindOfClass:NSArray.class]))) [out addObject:s];
+    if (d && !out.count) LOG("[RED] front end: %s has no live settings the Game menu can show; it has the frame-rate counter only", path.UTF8String);
+    if (!out.count) [out addObject:@{@"env": @"DM_SHOW_FPS", @"kind": @"toggle", @"label": @"Frame-rate counter", @"default": @"0", @"on": @"1", @"off": @"0"}];
+    else LOG("front end: Game menu: %lu settings that apply while the game runs (%s)", (unsigned long)out.count, path.UTF8String);
+    return rows = out;
+}
+static NSString *str_or(id v, NSString *dflt) { return [v isKindOfClass:NSString.class] ? v : dflt; }
+static BOOL setting_fixed(NSString *env) {   // set by an env file or by the launch environment (launcher.c): shown, not changed
+    const char *a = getenv("DM_ENV_FILE_KEYS"), *b = getenv("DM_ENV_LAUNCH_KEYS");
+    NSArray *keys = [[NSString stringWithFormat:@"%s %s", a ? a : "", b ? b : ""] componentsSeparatedByString:@" "];
+    return [keys containsObject:env];
+}
+static NSString *setting_now(NSDictionary *s) {   // the value the game runs with: its environment (Play, a saved choice, a pick here), else the list's default
+    NSString *env = s[@"env"];
+    if ([env isEqual:@"DM_SHOW_FPS"]) return g_fps ? str_or(s[@"on"], @"1") : str_or(s[@"off"], @"0");
+    const char *v = getenv(env.UTF8String);
+    return v ? @(v) : str_or(s[@"default"], @"");
+}
+static BOOL option_ok(NSString *env, NSString *v) {   // an option the running game can take now
+    if ([env isEqual:@"DM_FPS_TARGET"]) return nvn_fps_target_ok(v.intValue);
+    if ([env isEqual:@"DM_FRAMEGEN"] && [v isEqual:@"metalfx"]) return mtl_framegen_ok(2);
+    if ([env isEqual:@"DM_PRESENT_UPSCALE"] && [v isEqual:@"metalfx"]) return mtl_present_upscale_ok(1);
+    return YES;
+}
+@interface DmGameMenu : NSObject <NSMenuDelegate> @end
+@implementation DmGameMenu
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [menu removeAllItems];
+    for (NSDictionary *s in live_rows()) {
+        NSString *env = s[@"env"], *now = setting_now(s);
+        if (!dm_setting_live(env.UTF8String, NULL)) continue;
+        BOOL fixed = setting_fixed(env);
+        NSString *label = fixed ? [s[@"label"] stringByAppendingString:@" (set in env.txt)"] : s[@"label"];
+        if ([s[@"kind"] isEqual:@"toggle"]) {
+            NSString *on = str_or(s[@"on"], @"1"), *off = str_or(s[@"off"], @"0");
+            NSMenuItem *it = [menu addItemWithTitle:label action:@selector(pick:) keyEquivalent:@""];
+            it.target = self; it.enabled = !fixed; it.state = [now isEqual:on] ? NSControlStateValueOn : NSControlStateValueOff;
+            it.representedObject = @[s, [now isEqual:on] ? off : on];
+            continue;
+        }
+        NSMenu *sub = [[NSMenu alloc] initWithTitle:label]; sub.autoenablesItems = NO;
+        for (id o in s[@"options"]) {
+            if (![o isKindOfClass:NSArray.class] || [o count] != 2 || ![o[0] isKindOfClass:NSString.class] || ![o[1] isKindOfClass:NSString.class]) continue;
+            NSMenuItem *it = [sub addItemWithTitle:o[1] action:@selector(pick:) keyEquivalent:@""];
+            it.target = self; it.enabled = !fixed && option_ok(env, o[0]); it.state = [now isEqual:o[0]] ? NSControlStateValueOn : NSControlStateValueOff;
+            it.representedObject = @[s, o[0]];
+        }
+        NSMenuItem *it = [menu addItemWithTitle:label action:nil keyEquivalent:@""]; it.submenu = sub;
+    }
+    if (!menu.numberOfItems) [menu addItemWithTitle:@"No settings apply while the game runs" action:nil keyEquivalent:@""].enabled = NO;
+}
+- (void)pick:(NSMenuItem *)it {
+    NSDictionary *s = it.representedObject[0]; NSString *env = s[@"env"], *v = it.representedObject[1];
+    if (setting_fixed(env) || !dm_setting_live(env.UTF8String, v.UTF8String)) return;   // dm_setting_live logged why
+    setenv(env.UTF8String, v.UTF8String, 1);
+}
+@end
+static DmGameMenu *g_game_menu;   // NSMenu keeps its delegate unretained
 
 // ---------- Cheats: the menu and the panel (hle_cheats.c holds every state; these only show it and call it) ----------
 
@@ -1478,12 +1551,15 @@ void front_run(void (*guest)(void)) {
         [[bar addItemWithTitle:@"Cheats" action:nil keyEquivalent:@""] setSubmenu:cm];
         if (getenv("DM_CHEATS_WINDOW") && atoi(getenv("DM_CHEATS_WINDOW")))   // the Cheats panel open from the start (beside the game, not key)
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
+        // Game: the settings that apply while the game runs (DmGameMenu, above), the frame-rate counter among them; rebuilt on every open
+        g_game_menu = [DmGameMenu new];
+        NSMenu *gm = [[NSMenu alloc] initWithTitle:@"Game"];
+        gm.delegate = g_game_menu; gm.autoenablesItems = NO;
+        [[bar addItemWithTitle:@"Game" action:nil keyEquivalent:@""] setSubmenu:gm];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
-        static DmFpsItem *fps_target; fps_target = [DmFpsItem new];
-        NSMenuItem *fps_item = [wm addItemWithTitle:@"Frame-Rate Counter" action:@selector(toggle:) keyEquivalent:@""]; fps_item.target = fps_target;
         NSApp.mainMenu = bar;
-        { const char *e = getenv("DM_SHOW_FPS"); if (e && atoi(e)) { fps_show(YES); fps_item.state = NSControlStateValueOn; } }
+        { const char *e = getenv("DM_SHOW_FPS"); if (e && atoi(e)) fps_show(YES); }
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {
             // A game opened from a fullscreen app starts while macOS leaves that Space. Wait for activation and for the window to reach the active Space before asking for fullscreen
