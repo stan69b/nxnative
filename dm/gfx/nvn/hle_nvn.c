@@ -1836,6 +1836,54 @@ static nvn_fstep g_fs;   // present thread only
 static nvn_fgpu g_fg;   // the GPU time at kmin and at the current hold (nvn_fstep_gpu_slowed)
 static double g_fs_cost;   // the cost the last fstep_tick judged, in vsyncs (DM_NVN_TSV @fs_cost)
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
+// The frame-rate cap changed while the game runs (the Mac's Game menu, front_mac.m dm_setting_live): 30, 60, or 120 (the menu's Unlimited: up to the screen's refresh, for a game
+// whose engine limiter the host writes and whose speed at 120 was checked, profile fps_max; fps_high). The game must have started with a cap the host decides (the state page's
+// target, or DM_FPS_TARGET / the profile's fps_target with a limiter the host writes): a game left to its own interval keeps it. nvn_fps_target_set only records the cap; the present
+// thread applies it before its next frame step (fps_live_apply), so the frame step, the present cap, the engine limiter (hle_fpslock.c, nvn_fps_live) and the display link change
+// between two presents. With a state page, the page's target changes and fstep_tick's "the cap changed" path takes it, as for a movie's 30 (t_fstep: the player's cap). Without one,
+// a change to or from 120 also changes the ticks the frame step counts in (1/120 s or 1/60 s), so its state starts over
+static _Atomic int g_fps_req;   // a cap asked for and not applied yet (0 = none)
+static _Atomic int g_fps_live;   // the cap applied while the game runs (0 = the one it started with)
+static _Atomic int g_nvn_presented;   // NVN has presented: a Vulkan or OpenGL game paces itself elsewhere, and its limiter is not written (dm_fps_lock_tick runs here)
+int nvn_fps_live(void) { return atomic_load(&g_fps_live); }
+int nvn_fps_target_ok(int t) {   // t = 0: whether the running game takes a cap at all
+    if (!atomic_load(&g_nvn_presented)) return 0;
+    if (dm_fps_state) {
+        uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float f; memcpy(&f, &b, sizeof f);
+        return f > 0 && (!t || t == 30 || t == 60);   // the stubs hand whole vsyncs of 1/60 s: no 120
+    }
+    const char *e = getenv("DM_FPS_TARGET"); int t0 = e ? atoi(e) : DM_GAME_FPS_TARGET;
+    if (!t0 || !dm_fps_lock_engine()) return 0;
+    return !t || t == 30 || t == 60 || (t == 120 && DM_GAME_FPS_MAX >= 120);
+}
+int nvn_fps_target_set(int t) {
+    if (!t || !nvn_fps_target_ok(t)) { LOG("[nvn] frame rate cap %d fps: %s", t, nvn_fps_target_ok(0) ? "not offered for this game" : "this game paces itself (no frame step and no engine limit the host writes)"); return 0; }
+    atomic_store(&g_fps_req, t);
+    return 1;
+}
+static void fps_live_apply(void) {   // present thread, at the start of a present
+    int t = atomic_exchange(&g_fps_req, 0);
+    if (!t) return;
+    int was = atomic_load(&g_fps_live);
+    if (dm_fps_state) {
+        float f = (float)t, old; uint32_t b; memcpy(&b, &f, sizeof b);
+        uint32_t ob = __atomic_exchange_n((uint32_t *)dm_fps_state, b, __ATOMIC_RELAXED); memcpy(&old, &ob, sizeof old);
+        if (!was) was = (int)old;
+    } else {
+        if (!was) was = fps_high() ? 120 : fps_present_cap();
+        int high = t == 120, high_was = fps_high();
+        __atomic_store_n(&g_fps_high, high, __ATOMIC_RELAXED);
+        g_present_cap = high ? 60 : t;
+        if (high != high_was) {
+            memset(&g_fs, 0, sizeof g_fs); memset(&g_fg, 0, sizeof g_fg); atomic_store(&g_fs_k, 0);
+            if (g_hz > 0 && !getenv("DM_PRESENT_HZ")) g_hz = fstep_hz();
+            if (!high && !getenv("DM_PRESENT_LINK")) mtl_link_mode_set(1);   // high_cap_tick sets 2 while 120 is on
+        }
+    }
+    atomic_store(&g_fps_live, t);
+    LOG("[nvn] frame rate cap %d → %d fps while the game runs (%s)", was, t,
+        dm_fps_state ? "the frame step state page's target" : t == 120 ? "up to the screen's refresh, 120 at most" : "the engine limit the host writes");
+}
 // The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override)
 int nvn_fps_high_now(void) { return atomic_load(&g_fs_k) == 1 ? 120 : 60; }   // hle_fpslock.c: the target of the next game frame, from the hold in force
 int nvn_game_fps(void) { int c = fps_present_cap(); if (c) return c == 30 && atomic_load(&g_fs_k) == 1 && fstep_on() ? 60 : c; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() >= s + 1000000000ull ? 30 : 60; }
@@ -2006,6 +2054,7 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     dm_ue_cvar_tick();
+    atomic_store(&g_nvn_presented, 1); fps_live_apply();   // a cap the player changed while the game runs
     if (fps_high()) high_cap_tick();
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)dm_movie_playing(), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)
     int c = fps_step_cap();

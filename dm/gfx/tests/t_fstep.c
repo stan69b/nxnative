@@ -427,6 +427,26 @@ int main(void) {
         snprintf(b, sizeof b, "  probes %.0f, %.0f, %.0f, %.0f vsyncs apart; game time %.0f against real time %.2f (debt %.2f)", gaps[1], gaps[2], gaps[3], gaps[4], m.game, m.real, m.s.debt);
         check(gaps[1] >= 120 && gaps[2] >= 240 && gaps[3] >= 480 && gaps[4] >= 480 && gaps[4] < 640 && m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01, b);
     }
+    // The player's cap, changed while the game runs (the Mac's Game menu: hle_nvn.c nvn_fps_target_set writes the state page's target between presents): 60 → 30 → 60.
+    // kmax follows the cap as fstep_tick passes it (2 at the 30 cap, FSTEP_MAX at 60)
+    {   sim m = {0}; run(&m, 600, 0.5, 1, 3, 0); run(&m, 600, 0.5, 2, 2, 0);
+        check(m.s.k == 2 && m.next == 2, "player's cap 60 → 30, frames that fit: hold 2, step 2 at once");
+        run(&m, 1, 0.5, 1, 3, 0);
+        check(m.s.k == 1, "  30 → 60: hold 1 at the next frame");
+        run(&m, 600, 0.5, 1, 3, 0);
+        snprintf(b, sizeof b, "  and it stays: no step up, game time = real time (k %d, ups %llu, game %.0f, real %.0f)", m.s.k, (unsigned long long)m.s.ups, m.game, m.real);
+        check(m.s.k == 1 && m.s.ups == 0 && m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01, b);
+    }
+    {   // Ocarina of Time in Link's house on an M4 Air: hold 2 at the 60 cap (cost 1.6 at hold 2, 1.5 at hold 1 while the clock is up); the player picks 30, then 60 again.
+        // Back at 60 the probe to hold 1 fails and the hold settles at 2, as before the change: neither stuck at the 30 cap's hold nor stepped to 3
+        sim m = {0}; for (int i = 0; i < 1200; i++) run(&m, 1, m.s.k == 1 ? 1.5 : 1.6, 1, 3, 0);
+        check(m.s.k == 2, "Link's house at the 60 cap: hold 2");
+        run(&m, 1200, 1.6, 2, 2, 0);
+        check(m.s.k == 2 && m.next == 2, "  player's cap 30: hold 2, step 2");
+        int three = 0; for (int i = 0; i < 1800; i++) { run(&m, 1, m.s.k == 1 ? 1.5 : 1.6, 1, 3, 0); three += m.s.k == 3; }
+        snprintf(b, sizeof b, "  back to 60: hold 2, never 3 (k %d, frames at hold 3 %d, game %.0f, real %.0f, debt %.2f)", m.s.k, three, m.game, m.real, m.s.debt);
+        check(m.s.k == 2 && three == 0 && m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01, b);
+    }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }

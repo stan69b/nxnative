@@ -13394,7 +13394,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
 typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; uint64_t made_at; int made; NSUInteger refused[6]; } fx_state;
 static fx_state g_fx_present;   // only the present thread encodes or replaces the scaler
 static id<MTL4Compiler> g_fx_comp;
-static int g_fx_mode = -1;   // 1 = metalfx, 0 = off
+static _Atomic int g_fx_mode = -1;   // 1 = metalfx, 0 = off; mtl_present_upscale_set changes it while the game runs
 static int fx_mode(void) {
     if (g_fx_mode >= 0) return g_fx_mode;
     const char *e = getenv("DM_PRESENT_UPSCALE"); int v = 0;
@@ -13404,6 +13404,15 @@ static int fx_mode(void) {
     if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("present upscaling: this GPU has no Metal 4 MetalFX spatial scaler; the present scales bilinearly"); v = 0; }
     MLOG("present upscaling (DM_PRESENT_UPSCALE): %s", v ? "metalfx, MetalFX's spatial scaler where the picture is shown larger than the game renders it" : "off, bilinear");
     return g_fx_mode = v;
+}
+// Upscaling changed while the game runs (the Mac's Game menu, front_mac.m dm_setting_live): the present thread reads the mode at each present; the scaler is made at the first present
+// that wants it (fx_encode) and kept while it is off. v = 1 needs the Metal 4 MetalFX spatial scaler; a GPU without it keeps bilinear
+int mtl_present_upscale_ok(int v) { return v == 0 || (v == 1 && g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]); }
+int mtl_present_upscale_set(int v) {
+    if (!mtl_present_upscale_ok(v)) { MLOG("present upscaling: this GPU has no Metal 4 MetalFX spatial scaler; keeping bilinear"); return 0; }
+    fx_mode(); g_fx_mode = v;
+    MLOG("present upscaling: %s while the game runs", v ? "MetalFX" : "bilinear");
+    return 1;
 }
 // MetalFX scales the content (cw x ch) to its rectangle on the canvas (vp) when the rectangle is at least as large in both directions and larger in one
 static int fx_wanted(MTLViewport vp, NSUInteger cw, NSUInteger ch) {
@@ -13684,7 +13693,8 @@ static void present_gpu_note(double s, int fx) {   // fx: 0 bilinear, 1 MetalFX 
 // camera for a game that does not name them (Ocarina of Time draws its own upscaler, agl's NDSR, whose inputs include motion: the lead for them). Frames held 1 or 3 vsyncs, and the
 // present thread's own path without the display link, show their pictures as before. The real picture is drawn into a drawable-sized texture first (g_fg_tex), kept as the next
 // frame's previous one. On an Apple M4 the interpolator takes about 3 ms of GPU at 683x384 and 8-9 ms at 1920x1080 per generated picture, time a GPU-bound game no longer has
-static int g_fg_mode = -1;   // 0 off, 1 blend, 2 metalfx
+static _Atomic int g_fg_mode = -1;   // 0 off, 1 blend, 2 metalfx
+static _Atomic int g_fg_want = -1;   // a mode asked for while the game runs (mtl_framegen_set), not applied yet
 static int fg_mode(void) {
     if (g_fg_mode >= 0) return g_fg_mode;
     const char *e = getenv("DM_FRAMEGEN"); int v = 0;
@@ -13695,9 +13705,27 @@ static int fg_mode(void) {
     return g_fg_mode = v;
 }
 static id<MTLTexture> g_fg_tex[2], g_fg_out; static int g_fg_i, g_fg_have;   // the last two real pictures at the drawable's size (g_fg_i: the newest); the interpolator's output
-static int g_fg_pend; static uint64_t g_fg_pend_ticket;   // a real picture drawn but not shown yet (shown on the next tick), and its present ticket
+static int g_fg_pend;   // a real picture drawn but not shown yet (shown on the next tick, fg_show_pending)
+// Frame generation changed while the game runs (the Mac's Game menu, front_mac.m dm_setting_live): mtl_framegen_set records the mode, and the display link's thread takes it at
+// its next present with no real picture kept for the tick after (fg_apply), so a generated picture is never followed by another mode's. The pictures start over (the first frame
+// after a change is shown as it is); the textures stay at the drawable's size, and the interpolator is made the first time MetalFX is on (fg_textures). The display link follows at
+// its next frame: 60 Hz at a 30 cap while generation is on (mtl_fps_target). metalfx needs MetalFX's Metal 4 frame interpolator on this GPU
+int mtl_framegen_ok(int v) { return v == 0 || v == 1 || (v == 2 && g_q4 && [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:g_dev]); }
+int mtl_framegen_set(int v) {
+    if (v < 0 || v > 2 || !mtl_framegen_ok(v)) { MLOG("[RED] frame generation %d: this GPU has no Metal 4 MetalFX frame interpolator; left as it is", v); return 0; }
+    fg_mode(); g_fg_want = v;
+    return 1;
+}
+static void fg_apply(void) {   // display-link thread (or the present thread without a display link), before a present's encode
+    if (g_fg_pend || atomic_load(&g_fg_want) < 0) return;
+    int v = atomic_exchange(&g_fg_want, -1), was = fg_mode();
+    if (v < 0 || v == was) return;
+    g_fg_mode = v; g_fg_have = 0;
+    MLOG("frame generation %s → %s while the game runs", (const char *[]){"off", "blend", "metalfx"}[was], (const char *[]){"off", "blend", "metalfx"}[v]);
+}
+static uint64_t g_fg_pend_ticket;   // g_fg_pend's present ticket
 static id<MTLRenderPipelineState> g_fg_blend_pso; static MTLPixelFormat g_fg_fmt;
-static id<MTL4FXFrameInterpolator> g_fg_fi;
+static id<MTL4FXFrameInterpolator> g_fg_fi; static int g_fg_fi_tried;   // the interpolator, made once per picture size when metalfx is first on
 static id<MTL4CommandAllocator> g_fg_al[2]; static id<MTL4CommandBuffer> g_fg_cb[2]; static id<MTLBuffer> g_fg_uv[3], g_fg_uv_show[2]; static id<MTLSharedEvent> g_fg_ev; static uint64_t g_fg_val;
 // The kept picture's present goes through g_q4 like the others. A queue of its own, waiting on an event the generated present signals, was tried: in Link's house at a 30 cap the
 // game fell to 26.6 fps (frame p95 85 ms, 800 of 2,000 link ticks without a picture) against 29.1-30 on g_q4
@@ -13706,27 +13734,29 @@ static id<MTLTexture> fg_textures(id<MTLTexture> dst) {
     if (!g_fg_tex[0] || g_fg_tex[0].width != dst.width || g_fg_tex[0].height != dst.height || g_fg_tex[0].pixelFormat != dst.pixelFormat) {
         for (int i = 0; i < 2; i++) if (g_fg_tex[i]) res_remove(g_fg_tex[i]);
         if (g_fg_out) res_remove(g_fg_out);
-        g_fg_out = nil; g_fg_fi = nil; g_fg_have = 0;
+        g_fg_out = nil; g_fg_fi = nil; g_fg_fi_tried = 0; g_fg_have = 0;
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
         td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         for (int i = 0; i < 2; i++) { g_fg_tex[i] = [g_dev newTextureWithDescriptor:td]; g_fg_tex[i].label = @"frame generation picture"; res_add(g_fg_tex[i]); }
-        if (fg_mode() == 2) {
-            NSError *e = nil; if (!g_fx_comp) g_fx_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
-            MTLFXFrameInterpolatorDescriptor *d = [MTLFXFrameInterpolatorDescriptor new];
-            d.colorTextureFormat = d.outputTextureFormat = dst.pixelFormat; d.depthTextureFormat = d.motionTextureFormat = d.uiTextureFormat = MTLPixelFormatInvalid;
-            d.inputWidth = d.outputWidth = dst.width; d.inputHeight = d.outputHeight = dst.height;
-            g_fg_fi = g_fx_comp ? [d newFrameInterpolatorWithDevice:g_dev compiler:g_fx_comp] : nil;
-            if (g_fg_fi) {
-                MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
-                od.storageMode = MTLStorageModePrivate; od.usage = g_fg_fi.outputTextureUsage | MTLTextureUsageShaderRead;
-                g_fg_out = [g_dev newTextureWithDescriptor:od]; g_fg_out.label = @"frame generation output"; res_add(g_fg_out);
-            }
-            if (!g_fg_fi || !g_fg_out) { g_fg_fi = nil; MLOG("[RED] frame generation: MetalFX makes no frame interpolator for %lux%lu format %lu; blending instead", (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat); }
-        }
         if (!g_fg_ev) { g_fg_ev = [g_dev newSharedEvent]; for (int i = 0; i < 2; i++) { g_fg_al[i] = [g_dev newCommandAllocator]; g_fg_cb[i] = [g_dev newCommandBuffer]; g_fg_uv_show[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; res_add(g_fg_uv_show[i]); }
                         for (int i = 0; i < 3; i++) { g_fg_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; res_add(g_fg_uv[i]); } }
         res_commit();
-        MLOG("frame generation: pictures %lux%lu format %lu%s", (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat, g_fg_fi ? ", MetalFX frame interpolator made" : "");
+        MLOG("frame generation: pictures %lux%lu format %lu", (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat);
+    }
+    if (fg_mode() == 2 && !g_fg_fi_tried) {   // at the first metalfx present for this size (at the start, or after the Game menu turned it on)
+        g_fg_fi_tried = 1;
+        NSError *e = nil; if (!g_fx_comp) g_fx_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
+        MTLFXFrameInterpolatorDescriptor *d = [MTLFXFrameInterpolatorDescriptor new];
+        d.colorTextureFormat = d.outputTextureFormat = dst.pixelFormat; d.depthTextureFormat = d.motionTextureFormat = d.uiTextureFormat = MTLPixelFormatInvalid;
+        d.inputWidth = d.outputWidth = dst.width; d.inputHeight = d.outputHeight = dst.height;
+        g_fg_fi = g_fx_comp ? [d newFrameInterpolatorWithDevice:g_dev compiler:g_fx_comp] : nil;
+        if (g_fg_fi) {
+            MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
+            od.storageMode = MTLStorageModePrivate; od.usage = g_fg_fi.outputTextureUsage | MTLTextureUsageShaderRead;
+            g_fg_out = [g_dev newTextureWithDescriptor:od]; g_fg_out.label = @"frame generation output"; res_add(g_fg_out);
+        }
+        if (!g_fg_fi || !g_fg_out) { g_fg_fi = nil; MLOG("[RED] frame generation: MetalFX makes no frame interpolator for %lux%lu format %lu; blending instead", (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat); }
+        else { res_commit(); MLOG("frame generation: MetalFX frame interpolator made for %lux%lu", (unsigned long)dst.width, (unsigned long)dst.height); }
     }
     if (!g_fg_blend_pso || g_fg_fmt != dst.pixelFormat) {
         NSError *e = nil; id<MTLLibrary> lib = host_lib("present", &e);
@@ -13764,7 +13794,7 @@ static int fg_encode(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture
     int kind = present_encode_m4(cb, src, cur, crop, uvb, &g_fx_present);
     if (!kind) return 0;
     if (!gen || !g_fg_have) { fg_draw(cb, cur, nil, dst, g_fg_uv[alloc_i]); g_fg_i ^= 1; g_fg_have = 1; g_fg_plain++; return kind; }
-    if (g_fg_fi) {
+    if (g_fg_fi && fg_mode() == 2) {
         g_fg_fi.colorTexture = cur; g_fg_fi.prevColorTexture = prev; g_fg_fi.outputTexture = g_fg_out; g_fg_fi.depthTexture = nil; g_fg_fi.motionTexture = nil;
         g_fg_fi.deltaTime = (float)period; g_fg_fi.nearPlane = 0.1f; g_fg_fi.farPlane = 1000; g_fg_fi.fieldOfView = 60; g_fg_fi.aspectRatio = (float)dst.width / dst.height;
         g_fg_fi.motionVectorScaleX = g_fg_fi.motionVectorScaleY = 1; g_fg_fi.jitterOffsetX = g_fg_fi.jitterOffsetY = 0; g_fg_fi.shouldResetHistory = NO;
@@ -13876,6 +13906,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [g_q4 waitForDrawable:dr];
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
+    if (target_ts > 0 || !mtl_link_active()) fg_apply();   // a mode the Game menu chose, between two presents of the thread that shows the pictures
     int fgk = fg_mode() && target_ts > 0 ? (period > 0.025 && period < 0.045 ? 2 : 1) : 0;   // frame generation: on the display link, a generated picture for frames held 2 vsyncs
     if (!fgk) g_fg_have = 0;
     int kind = fgk ? fg_encode(cb, src, dr.texture, crop, g_present_uv[alloc_i], alloc_i, fgk == 2, ticket, period) : present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);

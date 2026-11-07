@@ -223,6 +223,7 @@ static void lock_find(void) {
 // presenting at a cap the game does not step by runs a fixed-step game fast or slow (Tears of the Kingdom 1.4.2 at 2x with DM_FPS_TARGET=60)
 int dm_fps_lock_engine(void) { pthread_once(&g_found, lock_find); return nrow || nier || fb.n; }
 int nvn_fps_high_now(void);   // hle_nvn.c
+int nvn_fps_live(void);   // hle_nvn.c: the cap the player chose while the game runs (0 = the one it started with)
 void dm_fps_lock_tick(void) {
     dynamic_resolution_tick();   // separate from the FPS cap
     static int state = -2, nlog[NLOCKS + 4], target, high; static const char *src;
@@ -240,6 +241,9 @@ void dm_fps_lock_tick(void) {
                   if (fb.n) LOG("main: Frostbite simulation rate left as the game sets it (%s)", src); return; }
         target = t; state = 0;
     }
+    // A cap the player changed while the game runs (the Mac's Game menu, hle_nvn.c nvn_fps_target_set): taken here at the present after hle_nvn.c applied it, logged again
+    static int live_was; int live = nvn_fps_live();
+    if (live && live != live_was) { live_was = live; high = live == 120; if (!high) target = live; src = "Game menu"; memset(nlog, 0, sizeof nlog); }
     if (high) target = nvn_fps_high_now();   // 120 while frames fit, else 60: the game's step stays what the screen shows (hle_nvn.c fps_high)
     if (nier) {
         // NieR:Automata US/EU 1.0.3 (3c10ec35c5ef4c3686b4053afb0e58e7):

@@ -129,6 +129,23 @@ static void latency(void) {   // Only variable-refresh fullscreen needs the late
     }
     g_present_latency = 0; test_fullscreen = test_variable_refresh = 0; link_sync(); g_link = nil; g_link_started = 0;
 }
+// Frame generation and upscaling changed while the game runs (the Mac's Game menu): asked from the menu's thread, taken between presents by the thread that shows the pictures.
+// No Metal 4 queue here, so MetalFX is refused and the mode stays as it was
+static void live_settings(void) {
+    g_fg_mode = 0; g_fg_want = -1; g_fg_pend = 0; g_fg_have = 1;
+    CHECK("frame generation: MetalFX refused without its Metal 4 interpolator", !mtl_framegen_ok(2) && !mtl_framegen_set(2) && g_fg_want < 0);
+    CHECK("frame generation: blend asked", mtl_framegen_set(1) && g_fg_want == 1 && fg_mode() == 0);
+    g_fg_pend = 1; fg_apply();
+    CHECK("  not taken while a real picture waits for its tick", fg_mode() == 0 && g_fg_want == 1);
+    g_fg_pend = 0; fg_apply();
+    CHECK("  taken at the next present, the pictures start over", fg_mode() == 1 && g_fg_want < 0 && !g_fg_have);
+    mtl_framegen_set(0); fg_apply();
+    CHECK("  and off again", fg_mode() == 0);
+    g_fx_mode = 0;
+    CHECK("upscaling: MetalFX refused without its Metal 4 scaler", !mtl_present_upscale_ok(1) && !mtl_present_upscale_set(1) && fx_mode() == 0);
+    CHECK("upscaling: standard taken at once", mtl_present_upscale_set(0) && fx_mode() == 0);
+    g_fg_mode = -1; g_fx_mode = -1;
+}
 static void metal_lifecycle(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     CHECK("Metal device available", device != nil); if (!device) return;
@@ -147,7 +164,7 @@ static void metal_lifecycle(void) {
 int main(int argc, char **argv) { @autoreleasepool {
     alarm(10); setbuf(stdout, NULL);
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "--metal"))) return 2;
-    thresholds(); backoff(); settings(); lifecycle(); latency();
+    thresholds(); backoff(); settings(); lifecycle(); latency(); live_settings();
     if (argc == 2) metal_lifecycle();
     printf("present rescue: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

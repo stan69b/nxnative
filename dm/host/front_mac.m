@@ -531,6 +531,55 @@ static void *guest_tramp(void *p) {
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
 __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
 
+// ---------- Settings the running game takes at once (the Game menu) ----------
+// The same contract as the iPhone's (front_ios.m dm_setting_live): value NULL asks whether the running game takes env at once; otherwise it is applied and logged, and the answer
+// is whether it could be. The caller keeps the environment and the saved choice (the Game menu below). Each setting reaches the host where it is read at run time:
+//   DM_FPS_TARGET 30 / 60 / 120 (Unlimited): hle_nvn.c nvn_fps_target_set, taken at the next present (the frame step state page's target, or the engine limit the host writes;
+//                 120 only for a game with an engine limiter whose speed at 120 was checked, profile fps_max); a game that paces itself takes none
+//   DM_FRAMEGEN off / blend / metalfx: nvn_mtl.m mtl_framegen_set, taken between presents; offered only where MetalFX's Metal 4 frame interpolator runs
+//   DM_OPMODE 1 / 0: docked or handheld, the operation mode change notification (hle_oe.c dm_set_opmode), as a Switch put in or taken out of its dock
+//   DM_PRESENT_UPSCALE off / metalfx: nvn_mtl.m mtl_present_upscale_set; offered only where MetalFX's Metal 4 spatial scaler runs
+//   DM_SHOW_FPS 1 / 0: the frame-rate counter (fps_show)
+int nvn_fps_target_ok(int t); int nvn_fps_target_set(int t);   // hle_nvn.c
+int mtl_framegen_ok(int v); int mtl_framegen_set(int v); int mtl_present_upscale_ok(int v); int mtl_present_upscale_set(int v);   // nvn_mtl.m
+bool dm_setting_live(const char *env, const char *value);
+bool dm_setting_live(const char *env, const char *value) {
+    if (!env || !g_win) return false;
+    if (!strcmp(env, "DM_FPS_TARGET")) {
+        if (!value) return nvn_fps_target_ok(0);
+        int t = atoi(value); if (!nvn_fps_target_set(t)) return false;
+        LOG("front end: frame rate %s (Game menu)", t == 120 ? "Unlimited, up to the screen's refresh" : t == 30 ? "30 fps" : "60 fps");
+        return true;
+    }
+    if (!strcmp(env, "DM_FRAMEGEN")) {
+        if (!value) return mtl_framegen_ok(2);
+        int v = !strcmp(value, "blend") ? 1 : !strcmp(value, "metalfx") || !strcmp(value, "1") ? 2 : 0;
+        if (!mtl_framegen_set(v)) return false;
+        LOG("front end: frame generation %s (Game menu)", (const char *[]){"off", "Blend", "MetalFX"}[v]);
+        return true;
+    }
+    if (!strcmp(env, "DM_OPMODE")) {
+        if (!value) return true;
+        int m = atoi(value) ? 1 : 0; dm_set_opmode(m);
+        LOG("front end: console mode %s (Game menu)", m ? "docked" : "handheld");
+        return true;
+    }
+    if (!strcmp(env, "DM_PRESENT_UPSCALE")) {
+        if (!value) return mtl_present_upscale_ok(1);
+        int v = !strcmp(value, "metalfx") || !strcmp(value, "1");
+        if (!mtl_present_upscale_set(v)) return false;
+        LOG("front end: upscaling %s (Game menu)", v ? "MetalFX" : "standard");
+        return true;
+    }
+    if (!strcmp(env, "DM_SHOW_FPS")) {
+        if (!value) return true;
+        int on = atoi(value) != 0; fps_show(on);
+        if (!on) LOG("front end: frame-rate counter off");
+        return true;
+    }
+    return false;
+}
+
 // ---------- Cheats: the menu and the panel (hle_cheats.c holds every state; these only show it and call it) ----------
 
 // A string of the engine as an NSString that is never nil: cheat names, sections and notes come from the player's files,

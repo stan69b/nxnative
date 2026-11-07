@@ -102,6 +102,44 @@ int main(void) {
       EXPECT("a frame step page needs no limiter",60,fps_present_cap());
       dm_fps_state=NULL;unsetenv("DM_FPS_TARGET");g_present_cap=-1;g_engine_stub=1;nvn_present_config(0,0);
     }
+    // A cap the player changes while the game runs (nvn_fps_target_set, the Mac's Game menu): recorded, then applied at the next present (fps_live_apply)
+    { win_t w={.interval=1};nvn_present_config(60,1);g_nvn_presented=0;
+      _Alignas(8) uint8_t state[64]={0};float cap=60,now;memcpy(state,&cap,4);dm_fps_state=state;
+      EXPECT("live cap: none before NVN presents",0,nvn_fps_target_ok(0));
+      g_nvn_presented=1;
+      EXPECT("live cap: a frame step page takes 30",1,nvn_fps_target_ok(30));
+      EXPECT("live cap: not 120 (the stubs step whole 1/60 s)",0,nvn_fps_target_ok(120));
+      EXPECT("live cap: 30 asked",1,nvn_fps_target_set(30));
+      EXPECT("live cap: not applied before the present",60,fps_step_cap());
+      fps_live_apply();memcpy(&now,state,4);
+      EXPECT("live cap: the page's target is 30",30,(int)now);
+      EXPECT("live cap: the frame step's cap follows",30,fps_step_cap());
+      EXPECT("live cap: present interval 2",2,present_itv(&w));
+      EXPECT("live cap: display-link target 30",30,nvn_game_fps());
+      nvn_fps_target_set(60);fps_live_apply();
+      EXPECT("live cap: back to 60",60,fps_step_cap());
+      EXPECT("live cap: what the engine limiter reads",60,nvn_fps_live());
+      cap=0;memcpy(state,&cap,4);
+      EXPECT("live cap: a game left to its own interval takes none",0,nvn_fps_target_set(30));
+      dm_fps_state=NULL;g_fps_live=0;
+      setenv("DM_FPS_TARGET","60",1);g_present_cap=-1;
+      EXPECT("live cap, engine limiter: 30 asked",1,nvn_fps_target_set(30));
+      fps_live_apply();
+      EXPECT("live cap, engine limiter: present cap 30",30,fps_present_cap());
+      EXPECT("live cap, engine limiter: period ns",33333333,present_period(&w));
+      EXPECT("live cap, engine limiter: 120 only with profile fps_max 120",DM_GAME_FPS_MAX>=120,nvn_fps_target_ok(120));
+      g_fps_req=120;fps_live_apply();   // the 120 path itself, whatever this profile's fps_max
+      EXPECT("live cap 120: the frame step counts 1/120 s",1,fps_high());
+      EXPECT("live cap 120: present tick 120 Hz",120,g_hz);
+      EXPECT("live cap 120: the frame step starts over",0,g_fs_k);
+      g_fps_req=60;fps_live_apply();
+      EXPECT("live cap 120 → 60: 1/60 s again",0,fps_high());
+      EXPECT("live cap 120 → 60: present tick 60 Hz",60,g_hz);
+      EXPECT("live cap 120 → 60: present cap 60",60,fps_present_cap());
+      g_engine_stub=0;
+      EXPECT("no limiter and no page: no live cap",0,nvn_fps_target_ok(0));
+      g_engine_stub=1;unsetenv("DM_FPS_TARGET");g_present_cap=-1;g_fps_live=0;g_fps_high=-1;g_nvn_presented=0;nvn_present_config(0,0);
+    }
     crash_install();   // the same SIGSEGV / SIGBUS handling as production (the page-fault hook is dispatched from within it)
     // 1. Bootstrap address lookup: bootstrap gets GetProcAddress, then uses it to get all the names
     PFNNVNBOOTSTRAPLOADERPROC boot = (PFNNVNBOOTSTRAPLOADERPROC)h_nvnBootstrapLoader;
