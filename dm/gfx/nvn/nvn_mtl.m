@@ -12561,8 +12561,10 @@ static const char *cctx_snap(void) {
 }
 // When the game itself asks for 30 fps (pacing by the game's present interval, interval 2, hle_nvn.c) the display link runs at 30 Hz too: games whose logic counts frames, such as Engage, are not pulled up to 60 fps by the display link on iOS
 __attribute__((weak)) int nvn_game_fps(void) { return 60; }   // hle_nvn.c provides the strong definition
+static int fg_mode(void);   // DM_FRAMEGEN (the present path, below)
 int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d: frame rate pinned by the test switch", env); }
-    int g = nvn_game_fps(); return env > 0 ? env : g == 30 || g == 120 ? g : 60; }
+    int g = nvn_game_fps(); if (g == 30 && fg_mode()) g = 60;   // frame generation shows a picture on every 60 Hz tick
+    return env > 0 ? env : g == 30 || g == 120 ? g : 60; }
 // Hand a submission to the GPU in segments (DM_NVN_CUT=draw count, 0 = off; default 64): when the game holds back the next frame's submit until this frame's GPU work is done (The Legend of Zelda: Breath of the Wild: the main thread's nvnSyncWait on the fence of the frame just submitted),
 // the GPU sits idle for the milliseconds the host spends translating inside the submit (in the shrine each frame is GPU 13 ms + translation 7 ms back to back). Each time this many draws have accumulated, the command buffer encoded so far is committed between two passes: the GPU runs the earlier passes while the CPU translates the later ones.
 // Cut only when no encoder is open and no pass is deferred / merged / hoisted; commit this batch's uploads first (later draws use them). The fence signal and completion work stay on the last segment only: the queue executes in commit order and every encoder starts with a queue barrier
@@ -13666,14 +13668,132 @@ static int present_offscreen_wait(id<MTLTexture> src, const int crop[4], id<MTLT
 }
 // The present command buffer's GPU time (its commit feedback: from its first to its last command, the MetalFX scaler and the present pass), every 600 presents as p50 / p95, apart
 // for presents through MetalFX and through the bilinear pass. Under g_pq_mu (the feedback handler)
-static void present_gpu_note(double s, int fx) {
-    static double v[2][600]; static int n[2];
+static void present_gpu_note(double s, int fx) {   // fx: 0 bilinear, 1 MetalFX scaler, 2 a generated picture (DM_FRAMEGEN)
+    static double v[3][600]; static int n[3];
     if (!(s > 0 && s < 1)) return;
     v[fx][n[fx]++] = s * 1e3;
     if (n[fx] < 600) return;
     double *a = v[fx]; for (int i = 1; i < 600; i++) { double x = a[i]; int j = i - 1; while (j >= 0 && a[j] > x) { a[j + 1] = a[j]; j--; } a[j + 1] = x; }
-    MLOG("present command buffer GPU time over 600 presents %s: p50 %.3f ms, p95 %.3f ms, max %.3f ms", fx ? "through MetalFX" : "through the bilinear pass", a[299], a[569], a[599]);
+    MLOG("present command buffer GPU time over 600 presents %s: p50 %.3f ms, p95 %.3f ms, max %.3f ms", fx == 2 ? "with a generated picture (DM_FRAMEGEN)" : fx ? "through MetalFX" : "through the bilinear pass", a[299], a[569], a[599]);
     n[fx] = 0;
+}
+// ---------- Frame generation (DM_FRAMEGEN, off by default) ----------
+// A game held 2 vsyncs a frame (30 fps on the 60 Hz display link) shows each picture on two ticks. With DM_FRAMEGEN=blend or metalfx the first of them shows a picture made from
+// the previous frame and this one, and the second shows this one: 60 pictures a second on screen, each real frame one tick (16.7 ms) later than without it. blend is a 50/50 mix
+// (a diagnostic of the pacing); metalfx is MetalFX's frame interpolator (MTL4FXFrameInterpolator, macOS / iOS 26) given colour alone: the host has no depth, motion vectors or
+// camera for a game that does not name them (Ocarina of Time draws its own upscaler, agl's NDSR, whose inputs include motion: the lead for them). Frames held 1 or 3 vsyncs, and the
+// present thread's own path without the display link, show their pictures as before. The real picture is drawn into a drawable-sized texture first (g_fg_tex), kept as the next
+// frame's previous one. On an Apple M4 the interpolator takes about 3 ms of GPU at 683x384 and 8-9 ms at 1920x1080 per generated picture, time a GPU-bound game no longer has
+static int g_fg_mode = -1;   // 0 off, 1 blend, 2 metalfx
+static int fg_mode(void) {
+    if (g_fg_mode >= 0) return g_fg_mode;
+    const char *e = getenv("DM_FRAMEGEN"); int v = 0;
+    if (e && !strcmp(e, "blend")) v = 1; else if (e && (!strcmp(e, "metalfx") || !strcmp(e, "1"))) v = 2;
+    else if (e && *e && strcmp(e, "off") && strcmp(e, "0")) MLOG("[RED] DM_FRAMEGEN=%s: blend, metalfx or off; keeping off", e);
+    if (v == 2 && !(g_q4 && [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:g_dev])) { MLOG("[RED] frame generation: this GPU has no Metal 4 MetalFX frame interpolator; blending instead"); v = 1; }
+    if (v) MLOG("frame generation (DM_FRAMEGEN): %s for frames held 2 vsyncs on the display link; each real frame is shown one tick later", v == 2 ? "MetalFX's frame interpolator, colour only" : "a 50/50 blend of the two frames");
+    return g_fg_mode = v;
+}
+static id<MTLTexture> g_fg_tex[2], g_fg_out; static int g_fg_i, g_fg_have;   // the last two real pictures at the drawable's size (g_fg_i: the newest); the interpolator's output
+static int g_fg_pend; static uint64_t g_fg_pend_ticket;   // a real picture drawn but not shown yet (shown on the next tick), and its present ticket
+static id<MTLRenderPipelineState> g_fg_blend_pso; static MTLPixelFormat g_fg_fmt;
+static id<MTL4FXFrameInterpolator> g_fg_fi;
+static id<MTL4CommandAllocator> g_fg_al[2]; static id<MTL4CommandBuffer> g_fg_cb[2]; static id<MTLBuffer> g_fg_uv[3], g_fg_uv_show[2]; static id<MTLSharedEvent> g_fg_ev; static uint64_t g_fg_val;
+// The kept picture's present goes through g_q4 like the others. A queue of its own, waiting on an event the generated present signals, was tried: in Link's house at a 30 cap the
+// game fell to 26.6 fps (frame p95 85 ms, 800 of 2,000 link ticks without a picture) against 29.1-30 on g_q4
+static uint64_t g_fg_gen, g_fg_shown, g_fg_plain;   // generated pictures, real pictures shown on the tick after, frames shown as before
+static id<MTLTexture> fg_textures(id<MTLTexture> dst) {
+    if (!g_fg_tex[0] || g_fg_tex[0].width != dst.width || g_fg_tex[0].height != dst.height || g_fg_tex[0].pixelFormat != dst.pixelFormat) {
+        for (int i = 0; i < 2; i++) if (g_fg_tex[i]) res_remove(g_fg_tex[i]);
+        if (g_fg_out) res_remove(g_fg_out);
+        g_fg_out = nil; g_fg_fi = nil; g_fg_have = 0;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        for (int i = 0; i < 2; i++) { g_fg_tex[i] = [g_dev newTextureWithDescriptor:td]; g_fg_tex[i].label = @"frame generation picture"; res_add(g_fg_tex[i]); }
+        if (fg_mode() == 2) {
+            NSError *e = nil; if (!g_fx_comp) g_fx_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
+            MTLFXFrameInterpolatorDescriptor *d = [MTLFXFrameInterpolatorDescriptor new];
+            d.colorTextureFormat = d.outputTextureFormat = dst.pixelFormat; d.depthTextureFormat = d.motionTextureFormat = d.uiTextureFormat = MTLPixelFormatInvalid;
+            d.inputWidth = d.outputWidth = dst.width; d.inputHeight = d.outputHeight = dst.height;
+            g_fg_fi = g_fx_comp ? [d newFrameInterpolatorWithDevice:g_dev compiler:g_fx_comp] : nil;
+            if (g_fg_fi) {
+                MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
+                od.storageMode = MTLStorageModePrivate; od.usage = g_fg_fi.outputTextureUsage | MTLTextureUsageShaderRead;
+                g_fg_out = [g_dev newTextureWithDescriptor:od]; g_fg_out.label = @"frame generation output"; res_add(g_fg_out);
+            }
+            if (!g_fg_fi || !g_fg_out) { g_fg_fi = nil; MLOG("[RED] frame generation: MetalFX makes no frame interpolator for %lux%lu format %lu; blending instead", (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat); }
+        }
+        if (!g_fg_ev) { g_fg_ev = [g_dev newSharedEvent]; for (int i = 0; i < 2; i++) { g_fg_al[i] = [g_dev newCommandAllocator]; g_fg_cb[i] = [g_dev newCommandBuffer]; g_fg_uv_show[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; res_add(g_fg_uv_show[i]); }
+                        for (int i = 0; i < 3; i++) { g_fg_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; res_add(g_fg_uv[i]); } }
+        res_commit();
+        MLOG("frame generation: pictures %lux%lu format %lu%s", (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat, g_fg_fi ? ", MetalFX frame interpolator made" : "");
+    }
+    if (!g_fg_blend_pso || g_fg_fmt != dst.pixelFormat) {
+        NSError *e = nil; id<MTLLibrary> lib = host_lib("present", &e);
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+        pd.colorAttachments[0].pixelFormat = dst.pixelFormat; pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorBlendAlpha;
+        pd.colorAttachments[0].destinationRGBBlendFactor = pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusBlendAlpha;
+        g_fg_blend_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!g_fg_blend_pso) MDIE("frame generation blend pipeline failed %s", e.localizedDescription.UTF8String);
+        g_fg_fmt = dst.pixelFormat;
+    }
+    return g_fg_tex[g_fg_i ^ 1];   // where the next real picture goes
+}
+// Draws a (drawable-sized) and, with b, b over it at half weight, into dst, 1:1 (uvb: this pass's constants)
+static void fg_draw(id<MTL4CommandBuffer> cb, id<MTLTexture> a, id<MTLTexture> b, id<MTLTexture> dst, id<MTLBuffer> uvb) {
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()];
+    float *uv = uvb.contents; float tw = a.width, th = a.height;
+    uv[0] = 0; uv[1] = 0; uv[2] = 1; uv[3] = 1; uv[4] = 0.5f / tw; uv[5] = 0.5f / th; uv[6] = 1 - 0.5f / tw; uv[7] = 1 - 0.5f / th;
+    [en setArgumentTable:g_present_args atStages:MTLRenderStageFragment];
+    [g_present_args setSamplerState:g_blit_samp.gpuResourceID atIndex:0]; [g_present_args setAddress:uvb.gpuAddress atIndex:0];
+    [en setViewport:(MTLViewport){0, 0, dst.width, dst.height, 0, 1}];
+    [g_present_args setTexture:a.gpuResourceID atIndex:0]; [en setRenderPipelineState:g_blit_pso]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (b) { [g_present_args setTexture:b.gpuResourceID atIndex:0]; [en setRenderPipelineState:g_fg_blend_pso]; [en setBlendColorRed:0.5f green:0.5f blue:0.5f alpha:0.5f]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; }
+    m4_end(en);
+}
+// present_now's encode with frame generation (gen: this frame is held 2 vsyncs on the display link): the real picture into g_fg_tex; then either it (shown now) or a picture made
+// from the previous one and it (shown now, the real one kept for the next tick, fg_show_pending). Returns the present kind (PRESENT_FAILED on failure)
+static int fg_encode(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], id<MTLBuffer> uvb, int alloc_i, int gen, uint64_t ticket, double period) {
+    if (g_fg_pend) { g_fg_i ^= 1; g_fg_pend = 0; }   // a kept picture whose tick never came (the hold changed): it is the previous one now
+    id<MTLTexture> cur = fg_textures(dst), prev = g_fg_tex[g_fg_i];
+    int kind = present_encode_m4(cb, src, cur, crop, uvb, &g_fx_present);
+    if (!kind) return 0;
+    if (!gen || !g_fg_have) { fg_draw(cb, cur, nil, dst, g_fg_uv[alloc_i]); g_fg_i ^= 1; g_fg_have = 1; g_fg_plain++; return kind; }
+    if (g_fg_fi) {
+        g_fg_fi.colorTexture = cur; g_fg_fi.prevColorTexture = prev; g_fg_fi.outputTexture = g_fg_out; g_fg_fi.depthTexture = nil; g_fg_fi.motionTexture = nil;
+        g_fg_fi.deltaTime = (float)period; g_fg_fi.nearPlane = 0.1f; g_fg_fi.farPlane = 1000; g_fg_fi.fieldOfView = 60; g_fg_fi.aspectRatio = (float)dst.width / dst.height;
+        g_fg_fi.motionVectorScaleX = g_fg_fi.motionVectorScaleY = 1; g_fg_fi.jitterOffsetX = g_fg_fi.jitterOffsetY = 0; g_fg_fi.shouldResetHistory = NO;
+        [g_fg_fi encodeToCommandBuffer:cb];
+        fg_draw(cb, g_fg_out, nil, dst, g_fg_uv[alloc_i]);
+    } else fg_draw(cb, prev, cur, dst, g_fg_uv[alloc_i]);
+    g_fg_pend = 1; g_fg_pend_ticket = ticket; g_fg_gen++;
+    return kind;
+}
+// The real picture fg_encode kept, shown on the display link's next tick (the one that would have held the frame). On the display-link thread
+static void fg_show_pending(id<CAMetalDrawable> dr) {
+    id<MTLTexture> cur = g_fg_tex[g_fg_i ^ 1];
+    uint64_t v = ++g_fg_val; int j = (int)(v % 2);
+    if (v > 2 && ![g_fg_ev waitUntilSignaledValue:v - 2 timeoutMS:500]) MLOG("[RED] frame generation: the present two ticks back has not finished in 500 ms");
+    [g_fg_al[j] reset];
+    [g_q4 waitForDrawable:dr];
+    id<MTL4CommandBuffer> cb = g_fg_cb[j];
+    [cb beginCommandBufferWithAllocator:g_fg_al[j]];
+    fg_draw(cb, cur, nil, dr.texture, g_fg_uv_show[j]);
+    [cb endCommandBuffer];
+    id<MTL4CommandBuffer> buffers[] = {cb};
+    [g_q4 commit:buffers count:1];
+    [g_q4 signalEvent:g_fg_ev value:v];
+    [g_q4 signalDrawable:dr];
+    uint64_t pn = g_fg_pend_ticket;
+    [dr addPresentedHandler:^(id<MTLDrawable> d) { CFTimeInterval tt = d.presentedTime; g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1}; }];
+    [dr present];
+    g_fg_i ^= 1; g_fg_pend = 0; g_fg_shown++;
+    if (g_fg_shown % 1800 == 0) MLOG("frame generation: %llu pictures generated, %llu real ones shown on the tick after, %llu frames shown as before", (unsigned long long)g_fg_gen, (unsigned long long)g_fg_shown, (unsigned long long)g_fg_plain);
 }
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
@@ -13756,9 +13876,11 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [g_q4 waitForDrawable:dr];
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
-    int kind = present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
+    int fgk = fg_mode() && target_ts > 0 ? (period > 0.025 && period < 0.045 ? 2 : 1) : 0;   // frame generation: on the display link, a generated picture for frames held 2 vsyncs
+    if (!fgk) g_fg_have = 0;
+    int kind = fgk ? fg_encode(cb, src, dr.texture, crop, g_present_uv[alloc_i], alloc_i, fgk == 2, ticket, period) : present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
     if (!kind) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
-    int fx_kind = kind == PRESENT_METALFX;
+    int fx_kind = g_fg_pend ? 2 : kind == PRESENT_METALFX;
     [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
@@ -13789,7 +13911,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 #if TARGET_OS_SIMULATOR   // The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
     (void)period; [dr present];
 #else
-    uint64_t pn = ticket;   // Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
+    uint64_t pn = g_fg_pend ? 0 : ticket;   // (a generated picture: the real one's time is recorded when it is shown, fg_show_pending) Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
         g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
@@ -13862,6 +13984,12 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_cond_broadcast(&g_link_cv);
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
+    // Frame generation: the tick after a generated picture shows the real one kept for it (fg_show_pending), whether or not the next frame is queued yet
+    if (g_fg_pend && g_dm_present_link && !g_rescue_mode && g_link_hold_until > 0 && update.targetPresentationTimestamp < g_link_hold_until - tol) {
+        pthread_mutex_unlock(&g_pq_mu);
+        @autoreleasepool { fg_show_pending(update.drawable); }
+        return;
+    }
     if (!g_dm_present_link || g_rescue_mode || g_pq_read == g_pq_in) { if (g_dm_present_link && !g_rescue_mode) g_link_empty++; pthread_mutex_unlock(&g_pq_mu); return; }
     // The previous frame's present interval was >= 2 (period > 25 ms): keep it on screen for its whole period before taking the next one, as the Switch flips only every N vertical syncs. This also holds while the link runs at 60 Hz (Mario 1.2.1 sets 2 for single frames, see nvn_game_fps in hle_nvn.c);
     //   before, every tick took the newest frame, so that frame, carrying the extra time step the game advanced for it, was shown for only 16.7 ms and the game looked like it jumped ahead
