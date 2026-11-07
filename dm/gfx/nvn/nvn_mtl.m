@@ -14378,6 +14378,43 @@ static int fg_mode(void) {
 }
 static id<MTLTexture> g_fg_tex[2], g_fg_out; static int g_fg_i, g_fg_have;   // the last two real pictures at the drawable's size (g_fg_i: the newest); the interpolator's output
 static int g_fg_pend;   // a real picture drawn but not shown yet (shown on the next tick, fg_show_pending)
+// Generation only while frames fit their hold. A generated picture costs present GPU time (on an Apple M4 about 8 ms at a 2560x1440 drawable), which a GPU-bound frame that
+// already misses its 2 vsyncs does not have: the next frame gets later still, and the frame step pays the lost time back with longer steps. Ocarina of Time in Kokiri Forest at a
+// 30 cap fell from 27.6 to 15.0 fps (game speed 0.74). So the display-link thread records, for each frame held 2 vsyncs, whether the next frame was shown at the tick its hold ends
+// (fg_late), and generation pauses after FG_GATE_MISS misses among the last 8 such frames; frames are then shown as without it until FG_GATE_RUN in a row fit, and it resumes. A pause
+// within FG_GATE_SHORT frames of resuming doubles the run the next resume needs (up to FG_GATE_RUN_MAX: frames that fit only without the generated picture's cost would otherwise
+// switch it on and off every few seconds); a pause after a longer stretch starts again at FG_GATE_RUN. Link's house at a 30 cap, where a frame misses now and then, keeps it
+#define FG_GATE_MISS 3
+#define FG_GATE_RUN 30
+#define FG_GATE_RUN_MAX 960
+#define FG_GATE_SHORT 300
+typedef struct { unsigned ring, off, run, need, since; } fg_gate;   // ring: misses of the last 8 frames (bit 0 the newest); off: paused; run: frames in a row that fit while paused;
+                                                                    // need: the run that resumes it; since: frames since it last resumed
+static int fg_gate_note(fg_gate *g, int miss) {   // one frame held 2 vsyncs: 1 when this pauses generation, 2 when it resumes it, otherwise 0
+    if (!g->need) { g->need = FG_GATE_RUN; g->since = FG_GATE_SHORT; }   // generating from the start counts as a long stretch
+    if (!g->off) {
+        g->ring = ((g->ring << 1) | !!miss) & 0xff; if (g->since < FG_GATE_SHORT) g->since++;
+        if (__builtin_popcount(g->ring) < FG_GATE_MISS) return 0;
+        g->need = g->since < FG_GATE_SHORT ? (g->need * 2 < FG_GATE_RUN_MAX ? g->need * 2 : FG_GATE_RUN_MAX) : FG_GATE_RUN;
+        g->off = 1; g->run = 0;
+        return 1;
+    }
+    g->run = miss ? 0 : g->run + 1;
+    if (g->run < g->need) return 0;
+    g->off = 0; g->ring = 0; g->since = 0;
+    return 2;
+}
+// A frame taken at tick t missed the hold of the frame before it, which ended at hold (0: no hold), when t is a tick or more after it (tol: how far a tick lies off its slot)
+static int fg_late(double t, double hold, double tol) { return hold > 0 && t > hold + tol + 0.002; }
+static fg_gate g_fg_gate; static int g_fg_prev2; static uint64_t g_fg_paused, g_fg_npause;   // display-link thread: the gate; the frame before was held 2 vsyncs; frames shown
+                                                                                              // without generation while paused; pauses
+static void fg_gate_frame(double t, double hold, double tol) {   // the display-link callback, taking a frame at tick t
+    if (!g_fg_prev2 || !fg_mode()) return;
+    int r = fg_gate_note(&g_fg_gate, fg_late(t, hold, tol));
+    if (r == 1) MLOG("frame generation paused (#%llu): %d of the last 8 frames held 2 vsyncs missed their hold (the next frame not ready at its tick); it resumes after %u frames in a row that fit",
+                     (unsigned long long)++g_fg_npause, __builtin_popcount(g_fg_gate.ring), g_fg_gate.need);
+    else if (r == 2) MLOG("frame generation resumed: %u frames in a row fit their hold (%llu frames shown without it in %llu pauses)", g_fg_gate.need, (unsigned long long)g_fg_paused, (unsigned long long)g_fg_npause);
+}
 // Frame generation changed while the game runs (the Mac's Game menu, front_mac.m dm_setting_live): mtl_framegen_set records the mode, and the display link's thread takes it at
 // its next present with no real picture kept for the tick after (fg_apply), so a generated picture is never followed by another mode's. The pictures start over (the first frame
 // after a change is shown as it is); the textures stay at the drawable's size, and the interpolator is made the first time MetalFX is on (fg_textures). The display link follows at
@@ -14392,7 +14429,7 @@ static void fg_apply(void) {   // display-link thread (or the present thread wit
     if (g_fg_pend || atomic_load(&g_fg_want) < 0) return;
     int v = atomic_exchange(&g_fg_want, -1), was = fg_mode();
     if (v < 0 || v == was) return;
-    g_fg_mode = v; g_fg_have = 0;
+    g_fg_mode = v; g_fg_have = 0; g_fg_gate = (fg_gate){0};   // the gate starts over too
     MLOG("frame generation %s → %s while the game runs", (const char *[]){"off", "blend", "metalfx"}[was], (const char *[]){"off", "blend", "metalfx"}[v]);
 }
 static uint64_t g_fg_pend_ticket;   // g_fg_pend's present ticket
@@ -14584,6 +14621,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
     if (target_ts > 0 || !mtl_link_active()) fg_apply();   // a mode the Game menu chose, between two presents of the thread that shows the pictures
     int fgk = fg_mode() && target_ts > 0 ? (period > 0.025 && period < 0.045 ? 2 : 1) : 0;   // frame generation: on the display link, a generated picture for frames held 2 vsyncs
+    if (fgk == 2 && g_fg_gate.off) { fgk = 0; g_fg_pend = 0; g_fg_paused++; }   // paused while frames miss their hold (fg_gate_frame): shown as without it
     if (!fgk) g_fg_have = 0;
     int kind = fgk ? fg_encode(cb, src, dr.texture, crop, g_present_uv[alloc_i], alloc_i, fgk == 2, ticket, period) : present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
     if (!kind) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
@@ -14715,8 +14753,10 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
     ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
+    fg_gate_frame(update.targetPresentationTimestamp, g_link_hold_until, tol);   // frame generation: did this frame come at the tick the hold before it ended
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
     g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
+    g_fg_prev2 = submitted && it.period > 0.025 && it.period < 0.045;
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
