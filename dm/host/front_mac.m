@@ -476,7 +476,7 @@ static void fps_show(BOOL on) {
         (void)t; uint64_t c[3]; mtl_present_counts(c); double now = CACurrentMediaTime(), gap, gpu; mtl_frame_stats(&gap, &gpu);
         if (now - t0 < 1.5) {
             char rate[64]; mtl_fps_text(c0.c, c, now - t0, rate, sizeof rate);
-            NSString *s = [NSString stringWithFormat:@" %s · max %.0f ms", rate, gap];
+            NSString *s = [NSString stringWithFormat:@" %@ · max %.0f ms", @(rate), gap];   // @(): the rate text is UTF-8 (its "·"), which %s would read in the legacy system encoding ("¬∑")
             if (gpu >= 0) s = [s stringByAppendingFormat:@" · GPU %.1f ms", gpu];
             l.stringValue = s; [l sizeToFit]; NSRect f = l.frame; f.size.width += 6; f.origin.y = cv.bounds.size.height - 8 - f.size.height; l.frame = f;
         }
