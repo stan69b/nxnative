@@ -146,6 +146,33 @@ static void live_settings(void) {
     CHECK("upscaling: standard taken at once", mtl_present_upscale_set(0) && fx_mode() == 0);
     g_fg_mode = -1; g_fx_mode = -1;
 }
+// Frame generation pauses while frames held 2 vsyncs miss their hold (the next frame not ready at the tick the hold ends) and resumes after a run that fits: a generated
+// picture's GPU time comes out of a frame already over its budget (Ocarina of Time outdoors at a 30 cap: 15.0 fps with it, 27.6 without)
+static void fg_gate_cases(void) {
+    fg_gate g = {0}; int r = 0, paused = 0;
+    for (int i = 0; i < 200; i++) r |= fg_gate_note(&g, i % 4 == 0);   // one miss in four, as Link's house at a 30 cap (29.6-30.0 fps): at most 2 in any 8
+    CHECK("frame generation gate: one miss in four keeps generating", r == 0 && !g.off);
+    fg_gate_note(&g, 1); fg_gate_note(&g, 1);
+    CHECK("  a third miss among the last 8 pauses it", g.off && g.need == FG_GATE_RUN);
+    for (int i = 0; i < FG_GATE_RUN - 1; i++) r |= fg_gate_note(&g, 0);
+    r |= fg_gate_note(&g, 1);
+    CHECK("  a miss before the run that fits starts the run again", g.off && r == 0 && g.run == 0);
+    for (int i = 0; i < FG_GATE_RUN - 1; i++) r |= fg_gate_note(&g, 0);
+    CHECK("  still paused one frame short", g.off && r == 0);
+    CHECK("  resumes after the run that fits", fg_gate_note(&g, 0) == 2 && !g.off && g.ring == 0);
+    for (int i = 0; i < 3; i++) paused |= fg_gate_note(&g, 1) == 1;
+    CHECK("  pausing again soon after resuming doubles the run it needs", paused && g.off && g.need == 2 * FG_GATE_RUN);
+    for (int k = 0; k < 10; k++) { for (unsigned i = 0; i < g.need; i++) fg_gate_note(&g, 0); for (int i = 0; i < 3; i++) fg_gate_note(&g, 1); }
+    CHECK("  up to its limit", g.off && g.need == FG_GATE_RUN_MAX);
+    for (unsigned i = 0; i < g.need; i++) fg_gate_note(&g, 0);
+    for (int i = 0; i < FG_GATE_SHORT; i++) fg_gate_note(&g, 0);
+    for (int i = 0; i < 3; i++) fg_gate_note(&g, 1);
+    CHECK("  and back to its first run after generating long enough", g.off && g.need == FG_GATE_RUN);
+    double hold = 10.0, tol = 0.002;   // a frame taken at the tick its predecessor's hold ends fits; a tick later is a miss
+    CHECK("frame generation gate: on time at the hold's end", !fg_late(hold + 0.0005, hold, tol) && !fg_late(hold - 0.001, hold, tol));
+    CHECK("  a 60 Hz tick or a 120 Hz refresh later misses", fg_late(hold + 1 / 60.0, hold, tol) && fg_late(hold + 1 / 120.0, hold, tol));
+    CHECK("  no hold, nothing to miss", !fg_late(hold + 1, 0, tol));
+}
 static void metal_lifecycle(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     CHECK("Metal device available", device != nil); if (!device) return;
@@ -191,7 +218,7 @@ static void counts(void) {
 int main(int argc, char **argv) { @autoreleasepool {
     alarm(10); setbuf(stdout, NULL);
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "--metal"))) return 2;
-    thresholds(); backoff(); settings(); lifecycle(); latency(); live_settings(); counts();
+    thresholds(); backoff(); settings(); lifecycle(); latency(); live_settings(); fg_gate_cases(); counts();
     if (argc == 2) metal_lifecycle();
     printf("present rescue: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }
