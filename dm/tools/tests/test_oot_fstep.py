@@ -1,4 +1,4 @@
-"""Execute Ocarina of Time's frame-step stub (agl's interval controller) on ARM64, without game files.
+"""Execute Ocarina of Time's frame-step stubs (agl's interval controller, the GPU meter's frame time) on ARM64, without game files.
 
 Optional dependency: unicorn. On macOS its JIT needs execution outside the sandbox.
 """
@@ -20,6 +20,7 @@ spec = importlib.util.spec_from_file_location('oot_patches', Path(__file__).reso
 patch = importlib.util.module_from_spec(spec); spec.loader.exec_module(patch)
 
 SITE, BACK, APPLY = 0x3b4ef84, 0x3b4ef88, 0x3b4f074
+METER, METER_BACK, METER_CONST = 0x5aa54, 0x5aa58, 0x3e40ec8   # the GPU meter's load of 16666.67 (1/60 s in microseconds), the instruction after it
 
 
 @unittest.skipIf(uc is None, 'optional ARM64 execution dependency: unicorn')
@@ -34,7 +35,7 @@ class IntervalController(unittest.TestCase):
         self.puts = []
         ctx = types.SimpleNamespace(here=lambda: self.cursor, emit=self.emit, site=lambda off, orig: None, put=self.put, state=self.state - self.base)
         patch.frame_step(ctx)
-        self.assertEqual([p[0] for p in self.puts], [SITE])
+        self.assertEqual([p[0] for p in self.puts], [SITE, METER])
         # the controller as the game leaves it: bounds 1..3, interval 1 fixed, fps 60, counters set
         self.u.mem_write(self.ctl, struct.pack('<2I', 1, 3))
         self.u.mem_write(self.ctl + 0x48, struct.pack('<6I', 1, 1, 5, 4, 60, 60))
@@ -83,11 +84,58 @@ class IntervalController(unittest.TestCase):
                 self.assertEqual(self.stepped(), 7)
 
     def test_site_branches_to_the_stub(self):
-        (off, words, why), = self.puts
+        off, words, why = self.puts[0]
         w = words[0]
         self.assertEqual(w >> 26, 0b000101)
         imm = w & 0x3ffffff
         self.assertEqual(off + (imm << 2), self.area)
+
+
+@unittest.skipIf(uc is None, 'optional ARM64 execution dependency: unicorn')
+class GpuMeterBudget(unittest.TestCase):
+    """The GPU meter's load is a percent of the frame time of the host's target, not of a fixed 1/60 s"""
+    base, area, state = 0x10000000, 0x3c50000, 0x14000000
+
+    def setUp(self):
+        self.u = uc.Uc(uc.UC_ARCH_ARM64, uc.UC_MODE_ARM)
+        for a, n in ((self.base, 0x3c60000), (self.base + 0x3e40000, 0x1000), (self.state, 0x4000)):
+            self.u.mem_map(a, n)
+        self.cursor = self.area
+        self.puts = {}
+        ctx = types.SimpleNamespace(here=lambda: self.cursor, emit=self.emit, site=lambda off, orig: None, put=self.put, state=self.state - self.base)
+        patch.frame_step(ctx)
+        self.u.mem_write(self.base + METER_CONST, struct.pack('<f', 16666.666))
+
+    def emit(self, w):
+        self.u.mem_write(self.base + self.cursor, struct.pack('<I', w)); self.cursor += 4
+
+    def put(self, off, words, why):
+        self.puts[off] = words
+        self.u.mem_write(self.base + off, struct.pack('<' + 'I' * len(words), *words))
+
+    def budget(self, target):
+        """s2 after the meter's load, as the game's code goes on with it at METER_BACK; x8 holds the constant's page, as the adrp before the site leaves it"""
+        self.u.mem_write(self.state, struct.pack('<f', target))
+        self.u.reg_write(arm.UC_ARM64_REG_X8, self.base + (METER_CONST & ~0xfff))
+        self.u.reg_write(arm.UC_ARM64_REG_V2, 0)
+        self.u.emu_start(self.base + METER, self.base + METER_BACK, count=40)
+        self.assertEqual(self.u.reg_read(arm.UC_ARM64_REG_PC) - self.base, METER_BACK)
+        self.assertEqual(self.u.reg_read(arm.UC_ARM64_REG_X8), self.base + (METER_CONST & ~0xfff))   # x8 is the game's again after the load
+        return struct.unpack('<f', struct.pack('<I', self.u.reg_read(arm.UC_ARM64_REG_V2) & 0xffffffff))[0]
+
+    def test_site_is_patched(self):
+        self.assertIn(METER, self.puts)
+
+    def test_target_frame_time(self):
+        for target, us in ((60.0, 16666.666), (30.0, 33333.332)):
+            with self.subTest(target=target):
+                self.assertAlmostEqual(self.budget(target), us, places=2)
+
+    def test_60_is_the_games_own_constant(self):
+        self.assertEqual(struct.pack('<f', self.budget(60.0)), struct.pack('<f', 16666.666))
+
+    def test_no_target_keeps_the_games_constant(self):
+        self.assertAlmostEqual(self.budget(0.0), 16666.666, places=2)
 
 
 if __name__ == '__main__':

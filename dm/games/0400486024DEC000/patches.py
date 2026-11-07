@@ -35,6 +35,27 @@ def frame_step(ctx):
     emit(B(here(), 0x3b4ef88))
     fs_put(0x3b4ef84, [B(0x3b4ef84, start)], "agl's interval controller: the host's step (state page target fps; 0 = the game's fixed interval)")
 
+    # The dynamic resolution's GPU load. The GPU meter (main+0x5a8f0, each frame) takes the GPU time between two counter timestamps in microseconds and its load as a percent of
+    # one 1/60 s frame (main+0x5aa54 loads 16666.67 from main+0x3e40ec8, which nothing else reads), and the resolution controller steps down above its palette's LoadThreshold (98,
+    # the palette's defaults at main+0x11e0920) and up after IncreaseCounterMax (60) frames below it. Under a 30 fps target a frame has 33.3 ms, but the load stayed a percent of
+    # 16.7 ms, so a 25 ms frame read 150% and the scene stayed at its floor (683x384 of 1536x864). The stub loads the frame time of the target instead, 1e6 / target fps (state page,
+    # a float: 16666.67 at 60, 33333.33 at 30); without a target, the game's constant. The target, not the step decided per frame: a frame held longer because it was late must not
+    # raise the budget, or a slow GPU would raise its own resolution
+    fs_site(0x5aa54, '02c94ebd')                                        # ldr s2,[x8,#0xec8]   16666.67 (x8 = its page)
+    start = here(); emit(ADRP(9, here(), FS_STATE_OFF))
+    for w in (0xb9400129,   # ldr w9,[x9]            target fps (float bits; 0 = off)
+              0x340000e9,   # cbz w9,orig (+7)
+              0x1e270123,   # fmov s3,w9
+              0x52848009,   # mov w9,#0x2400
+              0x72a92e89,   # movk w9,#0x4974,lsl #16   1e6
+              0x1e270122,   # fmov s2,w9
+              0x1e231842):  # fdiv s2,s2,s3          the target's frame time in microseconds
+        emit(w)
+    emit(B(here(), 0x5aa58))
+    emit(0xbd4ec902)                                                    # orig: ldr s2,[x8,#0xec8]
+    emit(B(here(), 0x5aa58))
+    fs_put(0x5aa54, [B(0x5aa54, start)], "GPU meter: the load is a percent of the target's frame time (state page target fps; 0 = the game's 1/60 s)")
+
 FRAME_STEP = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': frame_step}
 
 # How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
