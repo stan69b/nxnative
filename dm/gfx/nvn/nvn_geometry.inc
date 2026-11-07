@@ -550,11 +550,12 @@ static void geo_mesh_encode(id<MTLRenderCommandEncoder> en_) {
 // A program's task and mesh shaders are Metal object and mesh functions (dmsh_meshstage.py), kept in the tessellation stages' places (sh[3], sh[4]). The draw goes through draw() with its
 // pixel stage alone, a program of its own as a geometry draw's raster stage is, so it takes the render pass and the pixel stage's state like any draw; mtk_pso gives its pipeline and
 // mtk_encode binds the two stages and draws. The mesh stage shares the vertex stage's table, as geo_mesh_encode's does, and a task shader has the object stage's; both read the
-// draw's first workgroup at buffer 29. A pipeline is built in the background and its draws are left out until it is ready, as for a geometry mesh pipeline
+// draw's first workgroup at buffer 29. The prewarm lists' M rows build the pipelines before the first frame (warm_task, mtk_claim); a pipeline no list names is built by its first draw,
+// which waits for it (mtk_pso), as a draw with no stand-in waits for its render pipeline, and recorded for the next start
 static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t ind, ind_first; } g_mtk;   // ind: an indirect draw's threadgroups, ind_first: where the GPU finds its first
 static void draw_(const p_draw *dw, const p_draw_idx *di);
-static uint64_t g_mtk_n, g_mtk_wait;
-static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)}; static os_unfair_lock g_pso_mtk_lock = OS_UNFAIR_LOCK_INIT;
+static uint64_t g_mtk_n, g_mtk_wait;   // g_mtk_wait: draws left out, their pipeline having failed
+static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)}; static pthread_mutex_t g_pso_mtk_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pso_mtk_cv = PTHREAD_COND_INITIALIZER;
 static NSObject *g_pso_mtk_building;
 // A mesh pipeline must have a fragment function, where a vertex one need not (validateWithDevice). A task / mesh program with no pixel shader draws depth only (Ocarina of Time's foliage shadows)
 static id<MTLFunction> mtk_nop_fragment(void) {
@@ -563,30 +564,45 @@ static id<MTLFunction> mtk_nop_fragment(void) {
         fn = [l newFunctionWithName:@"dm_mesh_nop"]; if (!fn) MLOG("[RED] the empty fragment function did not compile: %s", e.localizedDescription.UTF8String); });
     return fn;
 }
-static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
-    NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
-    pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
-    memset(k.attr, 0, sizeof k.attr); memset(k.attr_hi, 0, sizeof k.attr_hi); memset(k.stream, 0, sizeof k.stream);
-    k.fsfn = (__bridge void *)(ts ? ts->fn : ms->fn);   // with ms in the key's vertex place: the task shader is the third of the pipeline's functions
-    os_unfair_lock_lock(&g_pso_mtk_lock); id ps = hm_get_id(&g_pso_mtk, &k);
-    if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &k, g_pso_mtk_building); }
-    os_unfair_lock_unlock(&g_pso_mtk_lock);
-    if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
-    MTLRenderPipelineDescriptor *d = pso_desc(&k, ms, fs, nil, 0);
+// The pipeline of key k (the mesh shader in its vertex place, the task or mesh function as its fsfn): the draw's (mtk_pso) and the prewarm's (warm_task, M rows)
+static id<MTLRenderPipelineState> mtk_build(NvShader *ts, NvShader *ms, NvShader *fs, const pso_key *k, NSError **e) {
+    MTLRenderPipelineDescriptor *d = pso_desc(k, ms, fs, nil, 0);
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
     m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction ?: mtk_nop_fragment(); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
     if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
     m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
-    const char *tk = ts ? ts->key : "-", *mk = ms->key, *fk = fs ? fs->key : "-"; pso_key kk = k;
-    dispatch_async(pp_bg_queue(), ^{
-        NSError *e = nil; uint64_t t0 = bp_now();
-        id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
-        MLOG("%stask / mesh pipeline: task %s mesh %s fragment %s, %.1f ms in the background%s%s", p ? "" : "[RED] ", tk, mk, fk, (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
-        os_unfair_lock_lock(&g_pso_mtk_lock); hm_put_id(&g_pso_mtk, &kk, p ?: NSNull.null); os_unfair_lock_unlock(&g_pso_mtk_lock);
-    });
-    return nil;
+    return [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:e];
+}
+// A pipeline the prewarm built (warm_claim, on the submit thread), unless a draw has made it already
+static void mtk_claim(const pso_key *k, id<MTLRenderPipelineState> ps) {
+    pthread_mutex_lock(&g_pso_mtk_mu);
+    if (!hm_get_id(&g_pso_mtk, k)) hm_put_id(&g_pso_mtk, k, ps);
+    pthread_mutex_unlock(&g_pso_mtk_mu);
+}
+static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
+    NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
+    pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
+    memset(k.attr, 0, sizeof k.attr); memset(k.attr_hi, 0, sizeof k.attr_hi); memset(k.stream, 0, sizeof k.stream);
+    k.fsfn = (__bridge void *)(ts ? ts->fn : ms->fn);   // with ms in the key's vertex place: the task shader is the third of the pipeline's functions
+    // A task / mesh draw has no stand-in, so it waits for its pipeline: built here on the first draw, or by the thread already building it. Left out until a background build was ready
+    // (the rule until OoT7), the draws of a pipeline Metal had not compiled before were missing for seconds while the passes that read what they write still ran: after Ocarina of Time's
+    // shader library changed, its foliage meshes' pipelines took 3-15 s each on the background queues, and every leaf and grass blade of Link's house drew pure white for about 25 s
+    pthread_mutex_lock(&g_pso_mtk_mu); id ps;
+    while ((ps = hm_get_id(&g_pso_mtk, &k)) && ps == g_pso_mtk_building) pthread_cond_wait(&g_pso_mtk_cv, &g_pso_mtk_mu);
+    if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &k, g_pso_mtk_building); }
+    pthread_mutex_unlock(&g_pso_mtk_mu);
+    if (ps) return ps == NSNull.null ? nil : ps;
+    NSError *e = nil; uint64_t t0 = bp_now();
+    id<MTLRenderPipelineState> p = mtk_build(ts, ms, fs, &k, &e);
+    uint64_t dt = bp_now() - t0; g_bp_pso_n++; g_bp_pso_ns += dt;   // in the frame's pipeline time (the long-frame line, the timing summary)
+    MLOG("%stask / mesh pipeline: task %s mesh %s fragment %s, %.1f ms (the draw waited)%s%s", p ? "" : "[RED] ", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", dt / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
+    if (p) {   // prewarmed at the next start: M <task key or -> <task stage> <the key, the mesh shader in its vertex place>
+        pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, ms, fs, 0, NULL, &sk); sk.fz = 0; pso_skey_hex(&sk, shex);
+        pso_record("M\t%s\t%d\t%s\n", ts ? ts->key : "-", ts ? ts->stage : 0, shex); pso_user_record("M\t%s\t%d\t%s\n", ts ? ts->key : "-", ts ? ts->stage : 0, shex); }
+    pthread_mutex_lock(&g_pso_mtk_mu); hm_put_id(&g_pso_mtk, &k, p ?: NSNull.null); pthread_cond_broadcast(&g_pso_mtk_cv); pthread_mutex_unlock(&g_pso_mtk_mu);
+    return p;
 }
 static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_; NvShader *ts = g_mtk.ts, *ms = g_mtk.ms;

@@ -220,6 +220,85 @@ static void scenario(NSString *dir, int merged) {
     printf("%s manifests: six rows -> %llu builds, %u cache keys\n", merged ? "merged" : "normal", (unsigned long long)g_warm_rps, g_pso.n);
 }
 
+// Task / mesh pipelines (OoT7). A first draw waits for its pipeline and records an M row: its draws were left out while a background build ran, seconds with a cold Metal cache,
+// and Ocarina of Time's foliage drew white meanwhile. An M row is built by the prewarm and claimed, so the draw takes it without a build. A synthetic mesh shader draws the fixture's colour
+static id<MTLRenderPipelineState> mesh_draw_pso(void) {
+    NvProg *raster = [NvProg new]; raster->sh[1] = g_shcache[@"warm-fs"];
+    g_mtk.ts = nil; g_mtk.ms = g_shcache[@"warm-ms"];
+    state_reset(); S.chmask.mask = 0xf; memset(g_pass.cfmt, 0, sizeof g_pass.cfmt); g_pass.cfmt[0] = MTLPixelFormatRGBA8Unorm; g_pass.dfmt = g_pass.sfmt = 0; g_pass.samples = 1;
+    return g_mtk.ms && raster->sh[1] ? mtk_pso(raster) : nil;
+}
+static void mesh_pixels(id<MTLRenderPipelineState> pipeline, uint8_t out[4]) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> target = [g_dev newTextureWithDescriptor:td];
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new]; pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear; pass.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLCommandQueue> queue = [g_dev newCommandQueue]; id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+    [enc setRenderPipelineState:pipeline];
+    [enc drawMeshThreadgroups:MTLSizeMake(1, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)]; [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    EXPECT("mesh draw completed", MTLCommandBufferStatusCompleted, cb.status);
+    [target getBytes:out bytesPerRow:16 fromRegion:MTLRegionMake2D(1, 1, 1, 1) mipmapLevel:0];
+}
+static void mesh_scenario(NSString *dir) {
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\nstruct MV { float4 p [[position]]; };\n"
+        "[[mesh]] void ms(mesh<MV, void, 3, 1, topology::triangle> m, uint t [[thread_index_in_threadgroup]]) {\n"
+        "    if (t == 0) m.set_primitive_count(1);\n"
+        "    if (t < 3) { MV v; v.p = float4(float2((t << 1) & 2, t & 2) * 2 - 1, 0, 1); m.set_vertex(t, v); m.set_index(t, t); }\n}\n";
+    NSString *metal = [dir stringByAppendingPathComponent:@"mesh.metal"], *library = [dir stringByAppendingPathComponent:@"warm-ms.metallib"];
+    EXPECT("mesh fixture written", 1, [source writeToFile:metal atomically:YES encoding:NSUTF8StringEncoding error:nil]);
+    NSTask *compiler = [NSTask new]; compiler.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcrun"]; compiler.arguments = @[@"-sdk", @"macosx", @"metal", metal, @"-o", library];
+    EXPECT("mesh fixture compiler runs", 1, [compiler launchAndReturnError:nil]); [compiler waitUntilExit];
+    EXPECT("mesh fixture compiles", 0, compiler.terminationStatus);
+    NSDictionary *reflection = @{@"chain": @DMSH_CHAIN, @"route": @"B", @"entry": @"ms", @"entry_z": @"ms", @"bindings": @[], @"vertex_inputs": @[],
+                                 @"mesh_stage": @{@"kind": @"ms", @"threads": @32, @"payload": @0, @"task": @NO}};
+    EXPECT("mesh reflection written", 1, [[NSJSONSerialization dataWithJSONObject:reflection options:0 error:nil] writeToFile:[dir stringByAppendingPathComponent:@"warm-ms.json"] atomically:YES]);
+    g_shmap[@"warm-ms"] = @"fixture";
+    NSString *rec = [dir stringByAppendingPathComponent:@"mesh-record.tsv"];
+    if (g_pso_record) fclose(g_pso_record);
+    setenv("DM_PSO_RECORD", rec.fileSystemRepresentation, 1); g_pso_record = NULL; g_pso_record_checked = 0;
+    // The first draw: built here, and the draw has it
+    g_shcache = [@{@"warm-ms": shader_get(@"warm-ms", 4), @"warm-fs": shader_get(@"warm-fs", 1)} mutableCopy];
+    nvn_hm_clear(&g_pso_mtk, hm_rel);
+    uint64_t built = g_bp_pso_n;
+    id<MTLRenderPipelineState> first = mesh_draw_pso();
+    EXPECT("a first task / mesh draw gets its pipeline (it was left out while a background build ran)", 1, first != nil);
+    EXPECT("built once, on the draw's thread", built + 1, g_bp_pso_n);
+    EXPECT("the next draw takes the same pipeline", 1, first && mesh_draw_pso() == first);
+    EXPECT("and builds nothing", built + 1, g_bp_pso_n);
+    const uint8_t colour[4] = {128, 64, 255, 128};
+    if (first) { uint8_t px[4]; mesh_pixels(first, px); int ok = 1; for (int i = 0; i < 4; i++) ok &= abs((int)px[i] - colour[i]) <= 1; EXPECT("the mesh pipeline draws the fragment's colour", 1, ok); }
+    if (g_pso_record) fclose(g_pso_record);
+    g_pso_record = NULL; unsetenv("DM_PSO_RECORD");
+    NSString *recorded = [NSString stringWithContentsOfFile:rec encoding:NSUTF8StringEncoding error:nil];
+    NSMutableArray<NSString *> *mrows = [NSMutableArray array];
+    for (NSString *l in [recorded componentsSeparatedByString:@"\n"]) if ([l hasPrefix:@"M\t"]) [mrows addObject:[l stringByAppendingString:@"\n"]];
+    EXPECT("the build is recorded as one M row", 1, mrows.count);
+    EXPECT("with no task shader", 1, mrows.count && [mrows[0] hasPrefix:@"M\t-\t0\t"]);
+    if (!mrows.count) return;
+    // The next start: the prewarm builds the row and the draw takes it (the same row twice is one pipeline)
+    nvn_hm_clear(&g_pso_mtk, hm_rel); g_shcache = nil; g_warm_items = [NSMutableArray array]; atomic_store(&g_warm_ready, 0); g_warm_mps = 0;
+    warm_load_begin();
+    NSString *manifest = [dir stringByAppendingPathComponent:@"mesh-seed.tsv"];
+    EXPECT("mesh manifest written", 1, [[mrows[0] stringByAppendingString:mrows[0]] writeToFile:manifest atomically:YES encoding:NSUTF8StringEncoding error:nil]);
+    long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(@[manifest], &lines);
+    EXPECT("one M line", 1, lines);
+    EXPECT("one task / mesh warm task", 1, tasks.count == 1 && tasks[0]->kind == 3);
+    for (WarmTask *t in tasks) warm_task(t);
+    EXPECT("the prewarm builds one task / mesh pipeline", 1, g_warm_mps);
+    warm_claim();
+    built = g_bp_pso_n;
+    id<MTLRenderPipelineState> warmed = mesh_draw_pso();
+    EXPECT("the draw takes the prewarmed pipeline", 1, warmed != nil);
+    EXPECT("without building one", built, g_bp_pso_n);
+    if (warmed) { uint8_t px[4]; mesh_pixels(warmed, px); int ok = 1; for (int i = 0; i < 4; i++) ok &= abs((int)px[i] - colour[i]) <= 1; EXPECT("the prewarmed pipeline draws the fragment's colour", 1, ok); }
+    g_shcache = nil; nvn_hm_clear(&g_pso_mtk, hm_rel);
+    printf("task / mesh: first draw built and recorded its pipeline, the M row prewarmed and claimed\n");
+}
+
 int main(void) { @autoreleasepool {
     alarm(60);   // A regression in owner/waiter progress must fail rather than hang the suite.
     setenv("DM_PSO_ARCHIVE", "off", 1); setenv("DM_NVN_PREDICT", "0", 1);
@@ -231,6 +310,7 @@ int main(void) { @autoreleasepool {
     EXPECT("prebuild tool workers: Metal's concurrent compiles", g_dev.maximumConcurrentCompilationTaskCount, compile_tasks());
     singleflight(@(dir));
     scenario(@(dir), 0); scenario(@(dir), 1);
+    mesh_scenario(@(dir));
     const char *mode = getenv("DM_PSO_MTL4");
     if (mode) EXPECT("requested compiler path selected", strcmp(mode, "0") != 0, g_comp4 != nil);
     [NSFileManager.defaultManager removeItemAtPath:@(dir) error:nil];
