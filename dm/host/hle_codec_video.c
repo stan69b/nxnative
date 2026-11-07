@@ -50,6 +50,7 @@ typedef struct {
     vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
     int eos_pending;
     int64_t clk_ts, fill_ts; uint64_t clk_ns, fill_ns, dropped;   // the movie clock (cv_due): a picture's time and the host time it went into a buffer; the last picture put in and when
+    int clk_read;   // the player has read a picture since the decoder started or was reset (cv_dec_props): only then can the clock start
 } cv_dec;
 
 static cv_dec *g_cv[16];
@@ -108,11 +109,14 @@ static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
 // the decoder answers for it: when a released buffer takes a picture, the held pictures behind the movie's clock are dropped and the one nearest it goes in, as a console that
 // keeps the movie's rate would have shown it. The clock is the time of a picture put in plus the host time since; it starts again (no catch-up) at the first picture, after
 // 200 ms with none put in (the player paused) and when the stream's time goes back (a new stream or a loop). A player that keeps up never loses a picture: the next one is
-// always due one picture later. Times are the client's own unit: only a stream whose pictures step by 4-100 ms read as nanoseconds (OoT's WebM times, milliseconds in ns) is
+// always due one picture later. The clock starts at a picture put in after the player has read one (cv_dec_props), not at the first picture decoded: a player that hands
+// back all its buffers at once and shows the first picture later (by its times) was 25-175 ms behind a clock started at the first picture and
+// lost 1-10 pictures once (t_codec_video's timed player); a player that never reads a picture's properties is left as it was. Times are the client's own unit: only a stream whose pictures step by 4-100 ms read as nanoseconds (OoT's WebM times, milliseconds in ns) is
 // clocked; any other unit is left as it was. Called with the decoder locked; returns the pictures dropped
 #define CV_CLK_GAP 200000000ull
 static int cv_due(cv_dec *d) {
     uint64_t now = now_ns(); int n = 0;
+    if (!d->clk_ns && !d->clk_read) { d->fill_ts = d->held_ts[0]; d->fill_ns = now; return 0; }   // the player has not read a picture yet: no clock
     if (!d->clk_ns || now - d->fill_ns > CV_CLK_GAP || d->held_ts[0] < d->fill_ts) { d->clk_ts = d->held_ts[0]; d->clk_ns = now; }
     else {
         int64_t due = d->clk_ts + (int64_t)(now - d->clk_ns);
@@ -332,7 +336,7 @@ static Result cv_dec_reset(void *t) {   // Stop / Flush: pictures not yet given 
     cv_dec *d = cv_of(t); if (!d) return 0;
     pthread_mutex_lock(&d->mu);
     for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
-    d->nheld = 0; d->eos_pending = 0; d->clk_ns = 0;   // the movie clock starts again at the next picture (cv_due)
+    d->nheld = 0; d->eos_pending = 0; d->clk_ns = 0; d->clk_read = 0;   // the movie clock starts again at a picture put in after the player's next read (cv_due)
     cv_open(d);
     if (d->event) hle_signal_system_event(d->event);
     pthread_mutex_unlock(&d->mu);
@@ -424,7 +428,7 @@ static Result cv_dec_props(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch,
     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) return CV_R(2004);
     pthread_mutex_lock(&d->mu);
     int ok = d->buf[i].filled;
-    if (ok) { *w = *cw = d->buf[i].w; *h = *ch = d->buf[i].h; *ts = d->buf[i].ts; *eos = d->buf[i].eos != 0; }
+    if (ok) { *w = *cw = d->buf[i].w; *h = *ch = d->buf[i].h; *ts = d->buf[i].ts; *eos = d->buf[i].eos != 0; d->clk_read = 1; }
     pthread_mutex_unlock(&d->mu);
     if (ok && cv_trace()) LOG("[codec] %s picture index %u time %lld read at %.3f ms", k_cv_name[d->codec], i, (long long)*ts, now_ns() / 1e6);
     return ok ? 0 : CV_NONE;

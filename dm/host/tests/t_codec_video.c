@@ -70,6 +70,28 @@ static int64_t paced(uint64_t read_ns, int n, int64_t unit, uint64_t pause_at, i
     g_clock = 1; return ts;
 }
 
+// A player that keeps up with a 60 fps movie by its times: both buffers handed back at once (two pictures decoded ahead), the first shown delay_ns after that, then each shown
+// for one picture time and handed back. Returns the reads whose picture was not the one after the previous
+static int timed(uint64_t delay_ns, int n) {
+    _Alignas(16) static uint8_t dec[0x400], pool[2][0x40], mem[2][16 * 16 * 4]; uint64_t size, align, id; uint32_t idx; cv_sync sync; uint16_t w, h, cw, ch; int64_t ts = 0, prev = -1; bool eos; int skips = 0;
+    cv_pref pref = h_cv_pref(16, 16, 3, 0); assert(!h_cv_poolsize(&size, &align, &pref, 1));
+    for (int i = 0; i < 2; i++) assert(!h_cv_pool(pool[i], mem[i], size, &pref, 1, 0));
+    assert(!h_cv_vp9init2(dec, 0x10000, 16, 16, 1, 1, 3)); cv_dec *d = cv_of(dec);
+    for (uint32_t i = 0; i < 2; i++) { assert(!h_cv_vp9reg(dec, i, pool[i], 0)); assert(!h_cv_vp9acq(&idx, &sync, dec)); }
+    int sent = 0; g_clock = 1000000000ull;
+    while (d->nheld < CV_HOLD) { int64_t t = (sent * 50 + 1) / 3; assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, t * 1000000, false)); sent++; }
+    h_cv_vp9rel(dec, 0, sync); h_cv_vp9rel(dec, 1, sync);
+    g_clock += delay_ns;
+    for (int r = 0; r < n; r++) {
+        while (d->nheld < CV_HOLD) { int64_t t = (sent * 50 + 1) / 3; assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, t * 1000000, false)); sent++; }
+        assert(!h_cv_vp9acq(&idx, &sync, dec)); assert(!h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, idx));
+        if (prev >= 0 && ts - prev > 17000000) skips++;
+        prev = ts; g_clock += 16666667; h_cv_vp9rel(dec, idx, sync);
+    }
+    assert(!h_cv_vp9fin(dec)); for (int i = 0; i < 2; i++) h_cv_poolfin(pool[i]);
+    g_clock = 1; return skips;
+}
+
 int main(void) {
     {   // the movie follows its clock when the player reads slower than the movie's rate, and loses nothing when it keeps up
         int skips; int64_t t;
@@ -78,6 +100,7 @@ int main(void) {
         t = paced(50000000, 300, 1000, 0, &skips); assert(t >= 14500000000ll && t <= 15000000000ll);   // 20 a second (hold 3): 15 s in 15 s
         t = paced(33333333, 300, 1, 0, &skips); assert(skips == 0);   // times in µs: the unit is not known for certain, nothing is dropped
         t = paced(33333333, 300, 1000, 150, &skips); assert(t >= 9700000000ll && t <= 10000000000ll);   // a 500 ms pause: the clock starts again from the picture after it, no catch-up
+        for (uint64_t dl = 0; dl <= 250; dl += 25) assert(timed(dl * 1000000, 300) == 0);   // a player that keeps up by time and shows its first picture up to 250 ms after it was decoded loses none
         printf("t_codec_video: the movie clock passed\n");
     }
 
