@@ -48,6 +48,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `engine` | 60 / 30 fps frame step (agl interval controller) | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | agl's display interval controller, which the game's frame manager steps its world by; other agl games may share it |
 | `build` → `engine` | Criterion's 60 fps mode, frame ticks and game step at fixed addresses | frame rate | blocked: one game on that engine here | judgement | 1 | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | the studio's engine, which its other games ship |
 | `build` → `engine` | Frostbite's frame regulator at a fixed pointer | frame rate | blocked: one Frostbite game here | judgement | 1 | [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md) | engine code other Frostbite games ship (the simulation's own rate is already set by name) |
+| `build` → `engine` | GPU meter's budget follows the target fps (dynamic resolution) | rendering | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | the game's own GPU meter divides by a literal 1/60 s; another build moves the literal and its load |
 | `build` → `engine` | Next Level Games' frame limiter target at a fixed address | frame rate | blocked: one game on that engine here | judgement | 1 | [Luigi's Mansion 3](../../dm/games/0100DCA0064A6000/README.md) | the studio's engine, which its other games ship |
 | `build` → `engine` | RE Engine's frame limit at a fixed pointer | frame rate | blocked: one RE Engine game here | judgement | 1 | [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) | engine code other RE Engine games ship |
 | `build` → `engine` | ThreadedStreamBuffer load-acquires | race | blocked: no game files of those games on the drive to compare | judgement | 1 | [FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition](../../dm/games/0100CE4010AAC000/README.md) | the race is in Unity 2018.4's ThreadedStreamBuffer, engine code other Unity games of that era ship (Cuphead, AI: THE SOMNIUM FILES, Raging Loop): a function-matched rule per Unity version |
@@ -89,7 +90,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 43 | 0 | 0 | `build` → `game` ×2 |
 | [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 1 | 0 | 0 | `build` → `engine` |
+| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 2 | 0 | 0 | `build` → `engine` ×2 |
 | [The Legend of Zelda: Tears of the Kingdom](#the-legend-of-zelda-tears-of-the-kingdom) | 0 | 0 | 9 | 0 | 0 | `build` → `game` |
 | [Xenoblade Chronicles 3](#xenoblade-chronicles-3) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 
@@ -596,8 +597,10 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), `0400486024DEC000`, [patches.py](../../dm/games/0400486024DEC000/patches.py).
 
 - **`build` → `engine`**, frame rate, blocked: frame-step stubs have no function-matched form yet, judgement: 60 / 30 fps frame step (agl interval controller). Agl's display interval controller, which the game's frame manager steps its world by; other agl games may share it
+- **`build` → `engine`**, rendering, blocked: frame-step stubs have no function-matched form yet, judgement: GPU meter's budget follows the target fps (dynamic resolution). The game's own GPU meter divides by a literal 1/60 s; another build moves the literal and its load
 
-- **v131072 `main`** `e0f3ccfa…` ([patches.py:38](../../dm/games/0400486024DEC000/patches.py#L38))
+- **v131072 `main`** `e0f3ccfa…` ([patches.py:59](../../dm/games/0400486024DEC000/patches.py#L59))
+  - frame step `+0x5aa54`: GPU meter: the load is a percent of the target's frame time (state page target fps; 0 = the game's 1/60 s)
   - frame step `+0x3b4ef84`: agl's interval controller: the host's step (state page target fps; 0 = the game's fixed interval)
 
 ### The Legend of Zelda: Tears of the Kingdom

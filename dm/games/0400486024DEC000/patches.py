@@ -64,4 +64,7 @@ BINDING = [
     {'what': '60 / 30 fps frame step (agl interval controller)', 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',
      'why': "agl's display interval controller, which the game's frame manager steps its world by; other agl games may share it",
      'blocked': 'frame-step stubs have no function-matched form yet'},
+    {'what': "GPU meter's budget follows the target fps (dynamic resolution)", 'now': 'build', 'goal': 'engine', 'purpose': 'rendering',
+     'why': "the game's own GPU meter divides by a literal 1/60 s; another build moves the literal and its load",
+     'blocked': 'frame-step stubs have no function-matched form yet'},
 ]
