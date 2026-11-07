@@ -92,7 +92,7 @@ Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizo
 
 ### Frame-rate counter
 
-Shows the frames per second at the top left. On the Mac it also shows the longest frame of the last second (a freeze shows there) and the GPU time per frame; **Game > Frame-rate counter** turns it on and off while the game runs.
+Shows the frames per second at the top left. On the Mac it also shows the longest frame of the last second (a freeze shows there) and the GPU time per frame; **Game > Frame-rate counter** turns it on and off while the game runs. While [frame generation](#frame-generation) adds pictures it shows two rates, the game's frames and the pictures on screen: `30 game · 60 shown fps`.
 
 ## Controls
 
