@@ -454,8 +454,11 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = 
 
 // Frame-rate counter (DM_SHOW_FPS=1, the iPhone's switch; the NSP script's Mac run command sets it unless --no-show-fps; Window > Frame-Rate Counter turns it on and off): top left over
 // the picture, once a second, the frames put on screen in that second (nvn_mtl.m counts them for NVN and the Vulkan layer alike), the longest time between two of them (a freeze shows
-// there and not in the rate) and the mean GPU time of the frames completed in that second. A longer span than 1.5 s (the app was stopped in a debugger) shows no reading
+// there and not in the rate) and the mean GPU time of the frames completed in that second. With frame generation (DM_FRAMEGEN) it shows two rates, the game's frames and the
+// pictures on screen, generated ones included ("30 game · 60 shown fps"; mtl_fps_text). A longer span than 1.5 s (the app was stopped in a debugger) shows no reading
 uint64_t mtl_present_count(void);
+void mtl_present_counts(uint64_t c[3]);
+void mtl_fps_text(const uint64_t from[3], const uint64_t to[3], double secs, char *out, size_t n);
 void mtl_frame_stats(double *gap_max_ms, double *gpu_ms);
 static NSTextField *g_fps; static NSTimer *g_fps_timer;
 static void fps_show(BOOL on) {
@@ -468,15 +471,16 @@ static void fps_show(BOOL on) {
     l.frame = NSMakeRect(8, cv.bounds.size.height - 8 - 18, 240, 18); l.autoresizingMask = NSViewMinYMargin;   // stays at the top left when the window resizes
     [cv addSubview:l];
     double gap, gpu; mtl_frame_stats(&gap, &gpu);   // starts the spans now
-    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+    __block struct { uint64_t c[3]; } c0; mtl_present_counts(c0.c); __block double t0 = CACurrentMediaTime();
     g_fps_timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime(), gap, gpu; mtl_frame_stats(&gap, &gpu);
+        (void)t; uint64_t c[3]; mtl_present_counts(c); double now = CACurrentMediaTime(), gap, gpu; mtl_frame_stats(&gap, &gpu);
         if (now - t0 < 1.5) {
-            NSString *s = [NSString stringWithFormat:@" %.0f fps · max %.0f ms", (n - n0) / (now - t0), gap];
+            char rate[64]; mtl_fps_text(c0.c, c, now - t0, rate, sizeof rate);
+            NSString *s = [NSString stringWithFormat:@" %s · max %.0f ms", rate, gap];
             if (gpu >= 0) s = [s stringByAppendingFormat:@" · GPU %.1f ms", gpu];
             l.stringValue = s; [l sizeToFit]; NSRect f = l.frame; f.size.width += 6; f.origin.y = cv.bounds.size.height - 8 - f.size.height; l.frame = f;
         }
-        n0 = n; t0 = now;
+        memcpy(c0.c, c, sizeof c0.c); t0 = now;
     }];
     LOG("front end: frame-rate counter on");
 }

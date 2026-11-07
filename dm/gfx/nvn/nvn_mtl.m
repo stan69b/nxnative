@@ -12943,6 +12943,18 @@ static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
+// The frame-rate counter's counts (front_mac.m, front_ios.m), as c[0..2]: game frames (present_now: the game's frames put on screen, frames the display link merged away
+// not counted), pictures shown (every drawable on screen, generated or real, counted when its presented handler has a time: present_handler; a dropped one does not count),
+// and the generated ones among them. Without frame generation the first two are the same frames; with it a frame held 2 vsyncs is one game frame and two pictures
+static _Atomic uint64_t g_shown_n, g_shown_gen;
+static void present_shown(CFTimeInterval at, int gen) { if (at > 0) { atomic_fetch_add(&g_shown_n, 1); if (gen) atomic_fetch_add(&g_shown_gen, 1); } }
+void mtl_present_counts(uint64_t c[3]) { c[0] = g_present_n; c[1] = atomic_load(&g_shown_n); c[2] = atomic_load(&g_shown_gen); }
+// The counter's rates over secs between two readings of mtl_present_counts: "30 game · 60 shown fps" when generated pictures were shown in the span, "60 fps" otherwise
+void mtl_fps_text(const uint64_t from[3], const uint64_t to[3], double secs, char *out, size_t n) {
+    double game = (to[0] - from[0]) / secs, shown = (to[1] - from[1]) / secs;
+    if (to[2] != from[2]) snprintf(out, n, "%.0f game \u00b7 %.0f shown fps", game, shown);
+    else snprintf(out, n, "%.0f fps", game);
+}
 // The Mac frame-rate counter (front_mac.m, DM_SHOW_FPS): the longest time between two presents since its last reading, or since the last present when that is longer (a freeze shows
 // there while it lasts, not in the frame rate: a second with no present read 0 ms), and the mean GPU time of the frames completed since then. Frames are taken 8 behind the current one, as
 // the timing line does (hle_nvn.c), so their command buffers have ended; one reader, the main thread
@@ -13269,6 +13281,11 @@ typedef struct { uint64_t n; double t; } pres_ent;
 static pres_ent g_pres[PRING];
 // Get the actual presentation time of the nth present (returns 0 if not ready, -1 if dropped)
 double mtl_presented_time(uint64_t n) { pres_ent e = g_pres[n % PRING]; return e.n == n ? e.t : 0; }
+// A drawable's presented handler (present_now, fg_show_pending): its time recorded by the game's present number pn (0 for a generated picture, whose real one records it when
+// shown), and the picture counted for the frame-rate counter (gen: a generated one)
+static void (^present_handler(uint64_t pn, int gen))(id<MTLDrawable>) {
+    return ^(id<MTLDrawable> d) { CFTimeInterval tt = d.presentedTime; g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1}; present_shown(tt, gen); };
+}
 // Ring of the display-link tick that took each present (written on the display-link callback thread, read 8 presents later for DM_NVN_TSV, as g_pres): its target display time
 // (seconds, CACurrentMediaTime base), how long before it the callback ran, the callbacks since the previous present's (1 = no tick without a frame) and the longest interval between them
 typedef struct { uint64_t n; double target, lead_ms, gap_ms; int ticks; } link_ent;
@@ -13819,18 +13836,21 @@ static void fg_show_pending(id<CAMetalDrawable> dr) {
     [g_q4 commit:buffers count:1];
     [g_q4 signalEvent:g_fg_ev value:v];
     [g_q4 signalDrawable:dr];
-    uint64_t pn = g_fg_pend_ticket;
-    [dr addPresentedHandler:^(id<MTLDrawable> d) { CFTimeInterval tt = d.presentedTime; g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1}; }];
+    [dr addPresentedHandler:present_handler(g_fg_pend_ticket, 0)];
     [dr present];
     g_fg_i ^= 1; g_fg_pend = 0; g_fg_shown++;
     if (g_fg_shown % 1800 == 0) MLOG("frame generation: %llu pictures generated, %llu real ones shown on the tick after, %llu frames shown as before", (unsigned long long)g_fg_gen, (unsigned long long)g_fg_shown, (unsigned long long)g_fg_plain);
 }
+// One game frame for the frame-rate counter and DM_HEAT (g_present_n), and the time since the previous one for the counter's longest gap (mtl_frame_stats)
+static void present_count_game(void) {
+    g_present_n++;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), last = atomic_exchange(&g_present_last, now), gap = last ? now - last : 0, m = atomic_load(&g_present_gap_max);
+    while (gap > m && !atomic_compare_exchange_weak(&g_present_gap_max, &m, gap)) {}
+}
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
-    g_present_n++;
-    { uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), last = atomic_exchange(&g_present_last, now), gap = last ? now - last : 0, m = atomic_load(&g_present_gap_max);
-      while (gap > m && !atomic_compare_exchange_weak(&g_present_gap_max, &m, gap)) {} }
+    present_count_game();
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
         MLOG("[bootprof] t=%.3f s present #%llu: metallibs loaded %llu / %.1f ms; pipelines created %llu / %.1f ms (all synchronous on the submit thread); prewarmed and used: shaders %llu / render pipelines %llu / compute pipelines %llu; "
@@ -13940,13 +13960,12 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     [g_q4 signalDrawable:dr];
     g_present_alloc_fence[alloc_i] = ticket;
 #if TARGET_OS_SIMULATOR   // The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
-    (void)period; [dr present];
+    (void)period; present_shown(1, g_fg_pend); [dr present];
 #else
-    uint64_t pn = g_fg_pend ? 0 : ticket;   // (a generated picture: the real one's time is recorded when it is shown, fg_show_pending) Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
-    [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
-        CFTimeInterval tt = d.presentedTime;
-        g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
-    }];
+    // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base), recorded by the game's present sequence number (ticket number): hle's present
+    // statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped). A generated
+    // picture records none (the real one's time is recorded when it is shown, fg_show_pending) and counts as a generated picture shown
+    [dr addPresentedHandler:present_handler(g_fg_pend ? 0 : ticket, g_fg_pend)];
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
     if (target_ts > 0) [dr present];
     else if (period > 0) [dr presentAfterMinimumDuration:period]; else [dr present];

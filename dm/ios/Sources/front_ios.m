@@ -197,7 +197,7 @@ static void launcher_done(void) { [g_root startGame]; }
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = CGRectIntersection(layout.controls, UIEdgeInsetsInsetRect(b, gameInsets));
         CGFloat u = layout.separated ? MIN(MIN(s.size.height / 430.0, s.size.width / 700.0), 1.3) : MIN(b.size.height / 430.0, 1.3);
-        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), MAX(64, ceil([self.fps sizeThatFits:CGSizeZero].width) + 12), 22);
     }
 }
 - (void)showFPS:(BOOL)on {   // the frame-rate counter: DM_SHOW_FPS at Play, then the in-game menu
@@ -309,20 +309,26 @@ static void front_ios_power_watch(void) {
     LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off");
 }
 
-// Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).
+// Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted);
+// with frame generation (DM_FRAMEGEN) the game's frames and the pictures on screen, generated ones included ("30 game · 60 shown fps"; mtl_fps_text), the label as wide as its text.
 // On when the IPA was built with it (the NSP script's SHOW_FPS / --show-fps → DMShowFPS in Info.plist); DM_SHOW_FPS=0 / 1 (the launcher, Documents/env.txt) overrides that without a rebuild,
 // and the in-game menu turns it on and off ([DmRootVC showFPS:])
-uint64_t mtl_present_count(void);
+void mtl_present_counts(uint64_t c[3]);
+void mtl_fps_text(const uint64_t from[3], const uint64_t to[3], double secs, char *out, size_t n);
 static UILabel *front_ios_fps_label(void) {
     UILabel *l = [UILabel new];
     l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
     l.text = @"-- fps";
-    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+    __block struct { uint64_t c[3]; } c0; mtl_present_counts(c0.c); __block double t0 = CACurrentMediaTime();
     [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
-        if (now - t0 < 1.5) l.text = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];   // a longer span is the time in the background: no reading
-        n0 = n; t0 = now;
+        (void)t; uint64_t c[3]; mtl_present_counts(c); double now = CACurrentMediaTime();
+        if (now - t0 < 1.5) {   // a longer span is the time in the background: no reading
+            char rate[64]; mtl_fps_text(c0.c, c, now - t0, rate, sizeof rate);
+            NSUInteger was = l.text.length; l.text = @(rate);
+            if (l.text.length != was) [l.superview setNeedsLayout];   // one rate or two: the layout sizes the label to its text
+        }
+        memcpy(c0.c, c, sizeof c0.c); t0 = now;
     }];
     LOG("front end: frame-rate counter on");
     return l;

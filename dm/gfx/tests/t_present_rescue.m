@@ -161,10 +161,37 @@ static void metal_lifecycle(void) {
     CHECK("present thread can take a real drawable after rescue", drawable != nil);
     [drawable present]; g_link_started = 0;
 }
+// The frame-rate counter's two counts: present_now counts a game frame; each drawable put on screen counts a shown picture in its presented handler (present_handler, which
+// present_now and fg_show_pending both attach), a dropped one (no presented time) none. With frame generation a frame held 2 vsyncs is one present_now (the generated picture)
+// and one fg_show_pending (the real one kept for the next tick)
+@interface FakeDrawable : NSObject
+@property CFTimeInterval presentedTime;
+@end
+@implementation FakeDrawable
+@end
+static void shown(uint64_t pn, int gen, CFTimeInterval at) { FakeDrawable *d = [FakeDrawable new]; d.presentedTime = at; present_handler(pn, gen)((id<MTLDrawable>)d); }
+static void counts(void) {
+    uint64_t a[3], b[3]; char s[64];
+    mtl_present_counts(a);
+    present_count_game(); shown(7, 1, 100.000); shown(7, 0, 100.0167);   // a generated picture, then the real one kept for it
+    mtl_present_counts(b);
+    CHECK("a generated + kept pair is one game frame", b[0] - a[0] == 1);
+    CHECK("a generated + kept pair is two shown pictures", b[1] - a[1] == 2);
+    CHECK("one of them generated", b[2] - a[2] == 1);
+    CHECK("the real picture's time is recorded by its ticket", g_pres[7 % PRING].n == 7 && g_pres[7 % PRING].t == 100.0167);
+    present_count_game(); shown(8, 0, 0);
+    mtl_present_counts(a);
+    CHECK("a dropped drawable is a game frame and no shown picture", a[0] - b[0] == 1 && a[1] == b[1] && a[2] == b[2]);
+    uint64_t z[3] = {0, 0, 0}, fg[3] = {30, 60, 30}, plain[3] = {60, 60, 0}, drop[3] = {60, 58, 0};
+    mtl_fps_text(z, fg, 1.0, s, sizeof s); CHECK("frame generation shows both counts", !strcmp(s, "30 game \u00b7 60 shown fps"));
+    mtl_fps_text(z, plain, 1.0, s, sizeof s); CHECK("without it one count, as before", !strcmp(s, "60 fps"));
+    mtl_fps_text(z, drop, 1.0, s, sizeof s); CHECK("dropped drawables alone do not split the count", !strcmp(s, "60 fps"));
+    uint64_t half[3] = {15, 30, 15}; mtl_fps_text(z, half, 0.5, s, sizeof s); CHECK("rates over the span", !strcmp(s, "30 game \u00b7 60 shown fps"));
+}
 int main(int argc, char **argv) { @autoreleasepool {
     alarm(10); setbuf(stdout, NULL);
     if (argc > 2 || (argc == 2 && strcmp(argv[1], "--metal"))) return 2;
-    thresholds(); backoff(); settings(); lifecycle(); latency(); live_settings();
+    thresholds(); backoff(); settings(); lifecycle(); latency(); live_settings(); counts();
     if (argc == 2) metal_lifecycle();
     printf("present rescue: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }
