@@ -34,6 +34,10 @@ On a Mac the game window's **Game** menu changes the frame rate while you play (
 
 On a Mac, **MetalFX** adds a picture between frames the game holds for two refreshes, so a game at 30 fps puts 60 pictures a second on screen. Apple's MetalFX frame interpolator makes it from the frames before and after. Each real frame then shows one refresh (16.7 ms) later. It uses GPU time, which a game already short of it no longer has, and it sees only the picture's colours: fast motion can smear, and the HUD moves with what is under it. **Blend** mixes the two frames half and half, to check the timing; it is not for playing. **Off**, the default, shows the frames as the game makes them. At 60 fps nothing changes, since no frame is held for two refreshes. The Game menu offers it only on a Mac whose GPU has MetalFX's frame interpolator. Chosen in the settings window on another Mac, MetalFX blends instead.
 
+### Dynamic resolution
+
+Off, the default, keeps the 3D picture at full size. On lets the game lower its resolution when frames run heavy, as on the Switch: steadier frame rate, softer picture. Only games whose resolution control the app can hold offer it (NieR:Automata, Ocarina of Time).
+
 ### Render scale
 
 The size of the 3D picture, from 50 to 100 %. Below 100 % the size is fixed there and the game's own dynamic resolution is off; 100 % keeps the game's own. Lower can be lighter on the GPU but is blurrier; the HUD and text keep their sharpness. Only games the app can scale offer it.
@@ -114,7 +118,7 @@ A controller's vibration weaker than this stays off, and the rest is spread over
 
 ### Press a button to join
 
-Off by default: each controller is a player as soon as it connects, in the order the system lists them. On: a controller becomes a player only when you press one of its buttons, as the lowest player free, so the players choose their order and how many play. That press also reaches the game. Press a button on every controller before the game asks how many play: a game that wants two players and sees one closes its player screen.
+Off by default: each controller is a player as soon as it connects, in the order the system lists them. On: a controller becomes a player only when you press one of its buttons, as the lowest player free, so the players choose their order and how many play. That press also reaches the game. When a game asks for more players than have joined, a prompt over the game waits for the others to press a button; B closes it.
 
 ## Performance
 

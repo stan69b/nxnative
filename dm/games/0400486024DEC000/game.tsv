@@ -37,8 +37,8 @@ shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=layout
 shader_note	Ocarina of Time shaders
 
 # ---- Frame rate ----
-# The game steps its world by its present interval, which it fixes at 1 (60 fps); at 30 fps on a slower GPU the world moved at half speed. The host decides each frame's step in whole
-# vsyncs and holds the frame that long (a rewriter stub at agl's interval controller, patches.py FRAME_STEP): 60 where the frame fits, 30 at full game speed where it does not
+# The game steps its time by a frame ratio, its base rate / its frame rate, whatever the frame took: frames longer than a vsync played in slow motion. The ratio takes the host's
+# frame step instead (MATCH_FRAME_STEP in patches.py, found by its function on any build that keeps it): 1 vsync at 60 fps, 2 when 60 does not hold, so game time = real time
 fps_target	60
 
 # ---- Graphics ----
