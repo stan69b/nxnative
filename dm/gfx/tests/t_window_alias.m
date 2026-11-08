@@ -56,6 +56,10 @@ int main(void) { @autoreleasepool {
     CHECK(one && first<N/2, "once the textures made apart pass the heap's size, every later description shares one heap");
     int at=first>0; for (int i=first>0?first:N;i<N;i++) { MTLSizeAndAlign q=[g_dev heapTextureSizeAndAlignWithDescriptor:tex_desc(&a[i],0)]; at &= m[i].heapOffset==(WIN_SCALE((uint64_t)(i%4)<<20)+q.align-1)/q.align*q.align; }
     CHECK(at, "each sits at its own address's offset in the span, scaled by 9/8");
+    // Bytes another description wrote are garbage to this one in Metal's layouts, where on NVN they meant the same: a lossless-compressed texture whose metadata another alias
+    // overwrote is undefined to read, and on the M1 iPad Ocarina of Time's GPU hung on one (kIOGPUCommandBufferCallbackErrorHang). Placed textures carry no GPU-optimized contents
+    int plain=first>0; for (int i=first>0?first:N;i<N;i++) plain &= !m[i].allowGPUOptimizedContents;
+    CHECK(plain, "placed textures have no GPU-optimized (lossless-compressed) contents");
     CHECK(delta<2*WIN_HEAP+(16u<<20), "the GPU memory taken is the span's, not the sum of the descriptions");
     CHECK(first>0 && [g_res_objects containsObject:m[first].heap] && ![g_res_objects containsObject:m[N-1]], "the heap is resident, its textures through it");
     // Bytes are shared as on NVN: a texture over storage another wrote reads it; storage that does not overlap is untouched

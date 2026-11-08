@@ -4169,9 +4169,14 @@ static void window_note(id<MTLTexture> mt, const tex_t *t, uint64_t win, uint64_
     objc_setAssociatedObject(mt, &g_win_live_key, l, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 // → the texture placed in its span's heap, or nil: then *note_size, if set, is what the caller notes (window_note) for the texture it makes apart
-static id<MTLTexture> window_texture(const tex_t *t, MTLTextureDescriptor *d, int *fill, uint64_t *note_win, uint64_t *note_size) {
+static id<MTLTexture> window_texture(const tex_t *t, MTLTextureDescriptor *gd, int *fill, uint64_t *note_win, uint64_t *note_size) {
     *fill = 1; *note_size = 0;
-    if (!window_ok(t) || d.storageMode != MTLStorageModePrivate) return nil;
+    if (!window_ok(t) || gd.storageMode != MTLStorageModePrivate) return nil;
+    // Without GPU-optimized contents. Textures that overlap here read each other's bytes, which on NVN mean the same thing (one block-linear layout) and in Metal do not: another
+    // description's writes leave a lossless-compressed texture's metadata invalid, and reading it is undefined. On the M1 iPad Ocarina of Time's GPU hung that way
+    // (kIOGPUCommandBufferCallbackErrorHang, a white flash, then GPU access revoked) turning the camera by Link's house, where its passes load targets that another format
+    // wrote over the same bytes in the same frame. Plain contents read as wrong values, as NVN's would after another format, but nothing the GPU can fail on
+    MTLTextureDescriptor *d = [gd copy]; d.allowGPUOptimizedContents = NO;
     MTLSizeAndAlign need = [g_dev heapTextureSizeAndAlignWithDescriptor:d];
     // A span is keyed by its index times 2; one across a span's end tries the spans offset by half a span (odd keys). Textures in different heaps do not share bytes, as before
     uintptr_t a = (uintptr_t)t->mem, rel = 0; uint64_t win = 0, lo = 0; int why = 0;
