@@ -447,12 +447,19 @@ check_t_alias_takeover: RUN_ENV = MTL_DEBUG_LAYER=1
 t_srgb_alias: t_srgb_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_srgb_alias.m $(MTL_T_SRC) $(FW)
 check_t_srgb_alias: RUN_ENV = MTL_DEBUG_LAYER=1
+t_window_alias: t_window_alias.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_window_alias.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_window_alias
+check_t_window_alias: t_window_alias
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_window_alias
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_window_alias
 t_image_alias: t_image_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_image_alias.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_image_alias
+# t_image_alias checks the same-offset families (image_texture) a texture falls back to when its span's heap cannot take it: with the spans off (t_window_alias checks those)
 check_t_image_alias: t_image_alias
-	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_image_alias
-	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_image_alias
+	DM_NVN_WINDOW_ALIAS=0 DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_image_alias
+	DM_NVN_WINDOW_ALIAS=0 DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_image_alias
 # A game's upscaler drawn by MetalFX (any profile; the profile's upscaler shaders, from its shader map, when it has some); with and without the switch, and on the encoding thread
 t_upscaler_mfx: t_upscaler_mfx.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upscaler_mfx.m $(MTL_T_SRC) $(FW)
