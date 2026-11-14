@@ -85,6 +85,7 @@ Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk
 ## Saves
 
 The game autosaves into `slot_00` and `slot_01`, with `option.sav` and `account.sav`. The Load screen lists them and reloading works. A save's thumbnail is a 543x306 JPEG in `caption.sav`, made from a copy of a texture to a buffer. A manual save (Menu, System, Save) on the current build has the picture (slot 02, mean colour 138 / 123 / 86). The autosaves in the work folder's saves, made on older chains, hold a black one. Open: an autosave made on the current build has not been looked at.
+- Open (2026-11-14): the iPhone 17 was ended for memory entering the castle grounds from the market, 30 minutes into the owner's play: that load made the 12288x12288 Depth16 shadow target again (alone in a 288 MB pool, a 300 MB heap), uploaded 301 textures (204 MB) in one 2-s frame, and the set reached 4,277 MB with 6,025 MB of the phone wired and two 300 MB heaps in it: [an area load holds its largest target twice](../../../docs/reference/memory.md#an-area-load-holds-its-largest-target-twice). The loads that make the target again: Hyrule Field into Kakariko Village and the market into the castle grounds; not Kakariko out to the field, not the Temple of Time's exit.
 
 ## Driving it on the Mac
 
@@ -267,3 +268,4 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 - [dav1d decoded one frame at a time](../../../docs/reference/movies.md#dav1d-decoded-one-frame-at-a-time): resolved, the title movie's heavy packets on an M2 Pro; and the drain that must go to its end.
 - [`devicectl` copies a large RomFS image through the Mac's memory](../../../docs/reference/packing.md#devicectl-copies-a-large-romfs-image-through-the-macs-memory): the 26.2 GB image's pushes to an iPad filled a 16 GB Mac's swap and failed; now sent over AFC.
 - [`devicectl`'s `--remove-existing-content` empties the app's whole container](../../../docs/reference/packing.md#devicectls---remove-existing-content-empties-the-apps-whole-container): the first complete copy of the image, deleted by the DLC step after it.
+- [An area load holds its largest target twice](../../../docs/reference/memory.md#an-area-load-holds-its-largest-target-twice): open, the iPhone 17 ended for memory entering the castle grounds with the old and the new 300 MB shadow target both in its residency set.
